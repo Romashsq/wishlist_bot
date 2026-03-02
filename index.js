@@ -1,12 +1,11 @@
 import "dotenv/config";
 import { Bot, InlineKeyboard, Keyboard } from "grammy";
 import OpenAI from "openai";
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
 import crypto from "crypto";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+import { connectDB } from "./src/db/connection.js";
+import User from "./src/models/User.js";
+import Wish from "./src/models/Wish.js";
+import Binding from "./src/models/Binding.js";
 
 // ─── OpenAI ───────────────────────────────────────────────────────────────
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -16,36 +15,6 @@ const bot = new Bot(process.env.BOT_TOKEN);
 
 // ─── Доступ к поиску ──────────────────────────────────────────────────────
 const SEARCH_ALLOWED = new Set([458227557, 739105994]);
-
-// ─── JSON helpers ─────────────────────────────────────────────────────────
-function readJsonSafe(filePath, defaultValue) {
-  try {
-    if (!fs.existsSync(filePath)) return defaultValue;
-    const raw = fs.readFileSync(filePath, "utf-8");
-    return JSON.parse(raw);
-  } catch {
-    return defaultValue;
-  }
-}
-
-function writeJsonSafe(filePath, data) {
-  try {
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf-8");
-  } catch (e) {
-    console.error("writeJsonSafe error:", filePath, e.message);
-  }
-}
-
-const WISHES_FILE = path.join(__dirname, "wishes.json");
-const BINDINGS_FILE = path.join(__dirname, "bindings.json");
-const USERS_FILE = path.join(__dirname, "users.json");
-
-const getWishes = () => readJsonSafe(WISHES_FILE, []);
-const saveWishes = (d) => writeJsonSafe(WISHES_FILE, d);
-const getBindings = () => readJsonSafe(BINDINGS_FILE, {});
-const saveBindings = (d) => writeJsonSafe(BINDINGS_FILE, d);
-const getUsers = () => readJsonSafe(USERS_FILE, {});
-const saveUsers = (d) => writeJsonSafe(USERS_FILE, d);
 
 // ─── State machine ────────────────────────────────────────────────────────
 /** @type {Map<string, object>} */
@@ -61,50 +30,42 @@ const generateId = () =>
   crypto.randomBytes(6).toString("hex") + "_" + Date.now();
 
 // ─── User helpers ─────────────────────────────────────────────────────────
-function ensureUser(ctx) {
-  const users = getUsers();
+async function ensureUser(ctx) {
   const userId = String(ctx.from.id);
-  if (!users[userId]) {
-    users[userId] = {
-      userId,
-      firstName: ctx.from.first_name || "Unknown",
-      role: "owner",
-      partnerIds: [],
-      createdAt: new Date().toISOString(),
-    };
-    saveUsers(users);
-  }
-  return users[userId];
+  await User.findOneAndUpdate(
+    { userId },
+    { $setOnInsert: { firstName: ctx.from.first_name || "Unknown", role: "owner", partnerIds: [], createdAt: new Date() } },
+    { upsert: true }
+  );
 }
 
-function updateUserRole(userId) {
-  const users = getUsers();
-  const bindings = getBindings();
+async function updateUserRole(userId) {
   const uid = String(userId);
-  if (!users[uid]) return;
-  const isOwner = uid in bindings;
-  const isBuyerFlag = Object.values(bindings).includes(uid);
-  if (isOwner && isBuyerFlag) users[uid].role = "both";
-  else if (isBuyerFlag) users[uid].role = "buyer";
-  else users[uid].role = "owner";
-  saveUsers(users);
+  const hasAssignedBuyer = await Binding.exists({ ownerId: uid });
+  const isBuyer = await Binding.exists({ viewerId: uid });
+  let role = "owner";
+  if (hasAssignedBuyer && isBuyer) role = "both";
+  else if (isBuyer) role = "buyer";
+  await User.updateOne({ userId: uid }, { role });
 }
 
-function getBuyerId(ownerId) {
-  return getBindings()[String(ownerId)] ?? null;
+async function getBuyerId(ownerId) {
+  const binding = await Binding.findOne({ ownerId: String(ownerId) });
+  return binding?.viewerId ?? null;
 }
 
-function getOwnerId(buyerId) {
-  const bindings = getBindings();
-  const bid = String(buyerId);
-  return Object.keys(bindings).find((k) => bindings[k] === bid) ?? null;
+async function getOwnerId(buyerId) {
+  const binding = await Binding.findOne({ viewerId: String(buyerId) });
+  return binding?.ownerId ?? null;
 }
 
-const isBuyerUser = (userId) => getOwnerId(String(userId)) !== null;
+async function isBuyerUser(userId) {
+  return (await Binding.exists({ viewerId: String(userId) })) !== null;
+}
 
 // ─── Keyboards ───────────────────────────────────────────────────────────
-function getMainKeyboard(userId) {
-  const buyer = isBuyerUser(String(userId));
+async function getMainKeyboard(userId) {
+  const buyer = await isBuyerUser(String(userId));
   const rows = [
     ["➕ Добавить товар", "🔍 Найти товар"],
     ["📋 Мои хотелки", "🎁 Идея подарка"],
@@ -307,8 +268,8 @@ STYLE RULES:
 
 /** GPT: запропонуй ідею подарунка з урахуванням вишліста */
 async function gptGiftIdea(userId) {
-  const ownerId = getOwnerId(userId) || userId;
-  const wishes = getWishes().filter((w) => w.ownerId === ownerId && w.status !== "archived");
+  const ownerId = (await getOwnerId(userId)) || userId;
+  const wishes = await Wish.find({ ownerId, status: { $ne: "archived" } });
   const wishList = wishes.map((w) => `«${w.title}» (${w.price})`).join(", ");
 
   return gptRequest([
@@ -475,7 +436,6 @@ function findProductInLd(obj) {
 /** Шукає name/price/image в довільному JSON об'єкті (Next.js pageProps) */
 function findProductInObj(obj, depth) {
   if (depth > 6 || !obj || typeof obj !== "object") return null;
-  // Look for an object that has name + (price or offers) + image
   const keys = Object.keys(obj);
   const hasName = keys.some((k) => k === "name" || k === "title" || k === "productName");
   const hasPrice = keys.some((k) => ["price", "salePrice", "currentPrice", "offers"].includes(k));
@@ -514,14 +474,11 @@ function extractRelevantHtml(html) {
   const parts = [];
   const titleM = html.match(/<title[^>]*>([^<]{1,300})<\/title>/i);
   if (titleM) parts.push(titleM[0]);
-  // Meta tags
   const metas = [...html.matchAll(/<meta[^>]+>/gi)].map((m) => m[0]);
   parts.push(...metas.slice(0, 30));
-  // JSON-LD scripts
   for (const m of html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>[\s\S]*?<\/script>/gi)) {
     parts.push(m[0].slice(0, 2000));
   }
-  // __NEXT_DATA__
   const nd = html.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>[\s\S]{0,6000}/i);
   if (nd) parts.push(nd[0]);
   return parts.join("\n").slice(0, 8000);
@@ -553,7 +510,6 @@ async function gptExtractProduct(html, url) {
 }
 
 function ogMeta(html, prop) {
-  // property="..." content="..." OR content="..." property="..."
   const patterns = [
     new RegExp(`<meta[^>]+property=["']${prop}["'][^>]+content=["']([^"']+)["']`, "i"),
     new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+property=["']${prop}["']`, "i"),
@@ -574,34 +530,25 @@ function htmlTitle(html) {
 
 // ─── SerpAPI Google Shopping ──────────────────────────────────────────────
 
-// Офіційні бренди та великі маркетплейси — найвищий пріоритет
 const TRUSTED_GLOBAL = [
-  // Великі міжнародні маркетплейси
   "asos", "zalando", "farfetch", "amazon", "ebay",
   "ssense", "mytheresa", "net-a-porter", "matchesfashion",
-  // Офіційні сайти брендів одягу
   "zara.com", "bershka.com", "mango.com", "hm.com", "uniqlo.com",
   "reserved.com", "sinsay.com", "cropp.com", "pullandbear.com",
   "massimodutti.com", "guess.com", "calzedonia.com", "intimissimi.com",
   "mohito.com", "parfois.com", "terranova.com", "lc-waikiki.com",
   "tommy.com", "calvinklein.com", "lacoste.com", "polo.com",
-  // Спорт (офіційні)
   "nike.com", "adidas.com", "puma.com", "newbalance.com",
   "reebok.com", "converse.com", "underarmour.com", "asics.com",
   "skechers.com", "vans.com", "timberland.com",
-  // Техніка (офіційні)
   "apple.com", "samsung.com", "sony.com", "dyson.com",
   "philips.com", "xiaomi.com", "lg.com",
-  // Краса (офіційні + великі мережі)
   "sephora.com", "lookfantastic.com", "douglas.ua",
   "mac-cosmetics.com", "nars.com", "lancome.com", "theordinary.com",
-  // Дім / Меблі
   "ikea.com", "leroy-merlin",
-  // Спортивні магазини
   "decathlon",
 ];
 
-// Українські магазини — другий пріоритет
 const UA_STORES = [
   "rozetka", "prom.ua", "allo", "epicentrk", "kasta",
   "comfy", "foxtrot", "citrus", "stylus", "brain.com.ua",
@@ -611,7 +558,6 @@ const UA_STORES = [
   "yakaboo", "bodo", "antoshka",
 ];
 
-/** Ранжування результату: 0 = trusted global, 1 = Ukrainian, 2 = other */
 function rankResult(item) {
   const src = (item.source || "").toLowerCase();
   const lnk = (item.link || "").toLowerCase();
@@ -628,8 +574,8 @@ async function searchGoogleShopping(query) {
   url.searchParams.set("engine", "google_shopping");
   url.searchParams.set("q", query);
   url.searchParams.set("api_key", key);
-  url.searchParams.set("hl", "ru");  // мова інтерфейсу
-  url.searchParams.set("num", "20"); // беремо 20, фільтруємо найкращі
+  url.searchParams.set("hl", "ru");
+  url.searchParams.set("num", "20");
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 12000);
@@ -641,13 +587,8 @@ async function searchGoogleShopping(query) {
     if (data.error) throw new Error(data.error);
 
     const all = data.shopping_results || [];
-
-    // Сортуємо: офіційні сайти → українські → решта
     const ranked = [...all].sort((a, b) => rankResult(a) - rankResult(b));
-
-    // Відфільтровуємо очевидний мотлох (немає назви або джерела)
     const filtered = ranked.filter((r) => r.title && (r.source || r.link));
-
     return filtered.slice(0, 5);
   } catch (e) {
     clearTimeout(timer);
@@ -658,9 +599,7 @@ async function searchGoogleShopping(query) {
 // ─── Business logic helpers ───────────────────────────────────────────────
 async function showOwnerWishes(ctx) {
   const ownerId = String(ctx.from.id);
-  const wishes = getWishes().filter(
-    (w) => w.ownerId === ownerId && w.status !== "archived"
-  );
+  const wishes = await Wish.find({ ownerId, status: { $ne: "archived" } }).sort({ createdAt: 1 });
   if (wishes.length === 0) {
     await ctx.reply("У тебя пока нет хотелок. Добавь первую! ➕");
     return;
@@ -674,16 +613,14 @@ async function showOwnerWishes(ctx) {
 
 async function showPartnerWishes(ctx) {
   const buyerId = String(ctx.from.id);
-  const ownerId = getOwnerId(buyerId);
+  const ownerId = await getOwnerId(buyerId);
   if (!ownerId) {
     await ctx.reply(
       "Тебя ещё никто не привязал как покупателя 😔\nПопроси партнёра выполнить /bind и ввести твой ID."
     );
     return;
   }
-  const wishes = getWishes().filter(
-    (w) => w.ownerId === ownerId && w.status !== "archived"
-  );
+  const wishes = await Wish.find({ ownerId, status: { $ne: "archived" } }).sort({ createdAt: 1 });
   if (wishes.length === 0) {
     await ctx.reply("У партнёра пока нет активных хотелок 🎉");
     return;
@@ -697,19 +634,17 @@ async function showPartnerWishes(ctx) {
 
 async function showBuyerHistory(ctx) {
   const buyerId = String(ctx.from.id);
-  const ownerId = getOwnerId(buyerId);
+  const ownerId = await getOwnerId(buyerId);
   if (!ownerId) {
     await ctx.reply("Тебя ещё никто не привязал как покупателя.");
     return;
   }
-  const wishes = getWishes().filter(
-    (w) => w.ownerId === ownerId && w.status === "bought"
-  );
+  const wishes = await Wish.find({ ownerId, status: "bought" }).sort({ updatedAt: -1 });
   if (wishes.length === 0) {
     await ctx.reply("Ещё ничего не куплено. Держись! 💪");
     return;
   }
-  const slice = wishes.slice(-10);
+  const slice = wishes.slice(0, 10);
   await ctx.reply(`🧾 *Куплено* (${slice.length}):`, { parse_mode: "Markdown" });
   for (const wish of slice) {
     await sendWishCard(ctx, buyerId, wish, undefined, true);
@@ -717,30 +652,29 @@ async function showBuyerHistory(ctx) {
 }
 
 async function updateWishStatus(ctx, buyerId, wishId, status) {
-  const wishes = getWishes();
-  const idx = wishes.findIndex((w) => w.id === wishId);
-  if (idx === -1) {
+  const wish = await Wish.findOneAndUpdate(
+    { id: wishId },
+    { status, updatedAt: new Date() },
+    { new: true }
+  );
+  if (!wish) {
     await ctx.reply("Хотелка не найдена.");
     return;
   }
-  wishes[idx].status = status;
-  wishes[idx].updatedAt = new Date().toISOString();
-  saveWishes(wishes);
 
   const statusLabel = { bought: "✅ Куплено", planned: "🛒 Планируется", archived: "💤 Отложено" };
   await ctx.reply(
-    `${statusLabel[status] ?? status}: *${escMd(wishes[idx].title)}*`,
+    `${statusLabel[status] ?? status}: *${escMd(wish.title)}*`,
     { parse_mode: "Markdown" }
   );
 
-  const ownerId = wishes[idx].ownerId;
-  const users = getUsers();
-  const buyerName = users[buyerId]?.firstName ?? "Покупатель";
+  const buyer = await User.findOne({ userId: buyerId });
+  const buyerName = buyer?.firstName ?? "Покупатель";
   const actionLabel = { bought: "купил(а)", planned: "планирует купить", archived: "отложил(а)" };
   try {
     await bot.api.sendMessage(
-      ownerId,
-      `💝 *${escMd(buyerName)}* ${actionLabel[status] ?? "обновил(а) статус"} хотелки *${escMd(wishes[idx].title)}*`,
+      wish.ownerId,
+      `💝 *${escMd(buyerName)}* ${actionLabel[status] ?? "обновил(а) статус"} хотелки *${escMd(wish.title)}*`,
       { parse_mode: "Markdown" }
     );
   } catch {
@@ -750,8 +684,8 @@ async function updateWishStatus(ctx, buyerId, wishId, status) {
 
 /** Finalize and persist a wish from state, notify buyer */
 async function finalizeWish(ctx, userId, s) {
-  const buyerId = getBuyerId(userId);
-  const wish = {
+  const buyerId = await getBuyerId(userId);
+  const wish = new Wish({
     id: generateId(),
     ownerId: userId,
     buyerId: buyerId ?? null,
@@ -763,18 +697,15 @@ async function finalizeWish(ctx, userId, s) {
     priority: s.priority ?? 2,
     status: "new",
     noteFromBuyer: "",
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  };
-
-  const wishes = getWishes();
-  wishes.push(wish);
-  saveWishes(wishes);
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  });
+  await wish.save();
   clearState(userId);
 
   const gptComment = await gptWishComment(wish.title);
   await ctx.reply(`✅ Хотелка сохранена!\n\n${gptComment}`, {
-    reply_markup: getMainKeyboard(userId),
+    reply_markup: await getMainKeyboard(userId),
   });
 
   if (buyerId) {
@@ -828,14 +759,14 @@ await bot.api.setMyCommands([
 // ─── /start ───────────────────────────────────────────────────────────────
 bot.command("start", async (ctx) => {
   try {
-    ensureUser(ctx);
+    await ensureUser(ctx);
     clearState(ctx.from.id);
     const name = ctx.from.first_name || "друг";
     await ctx.reply(
       `Привет, *${escMd(name)}*! 💕\n\nЯ — бот-вишлист для вашей пары.\n` +
         `Добавляй хотелки, а партнёр будет знать, что тебе подарить 🎁\n\n` +
         `Используй меню ниже 👇`,
-      { parse_mode: "Markdown", reply_markup: getMainKeyboard(ctx.from.id) }
+      { parse_mode: "Markdown", reply_markup: await getMainKeyboard(ctx.from.id) }
     );
   } catch (e) {
     console.error("/start error:", e);
@@ -845,8 +776,8 @@ bot.command("start", async (ctx) => {
 // ─── /menu ────────────────────────────────────────────────────────────────
 bot.command("menu", async (ctx) => {
   try {
-    ensureUser(ctx);
-    await ctx.reply("Главное меню:", { reply_markup: getMainKeyboard(ctx.from.id) });
+    await ensureUser(ctx);
+    await ctx.reply("Главное меню:", { reply_markup: await getMainKeyboard(ctx.from.id) });
   } catch (e) {
     console.error("/menu error:", e);
   }
@@ -893,7 +824,7 @@ bot.command("help", async (ctx) => {
 bot.command("cancel", async (ctx) => {
   try {
     clearState(ctx.from.id);
-    await ctx.reply("Действие отменено.", { reply_markup: getMainKeyboard(ctx.from.id) });
+    await ctx.reply("Действие отменено.", { reply_markup: await getMainKeyboard(ctx.from.id) });
   } catch (e) {
     console.error("/cancel error:", e);
   }
@@ -902,7 +833,7 @@ bot.command("cancel", async (ctx) => {
 // ─── /bind ────────────────────────────────────────────────────────────────
 bot.command("bind", async (ctx) => {
   try {
-    ensureUser(ctx);
+    await ensureUser(ctx);
     setState(ctx.from.id, { mode: "bind" });
     await ctx.reply(
       "Введи Telegram ID покупателя (только цифры).\n\n" +
@@ -917,14 +848,13 @@ bot.command("bind", async (ctx) => {
 bot.command("unbind", async (ctx) => {
   try {
     const ownerId = String(ctx.from.id);
-    const bindings = getBindings();
-    if (bindings[ownerId]) {
-      const oldBuyerId = bindings[ownerId];
-      delete bindings[ownerId];
-      saveBindings(bindings);
-      updateUserRole(ownerId);
-      updateUserRole(oldBuyerId);
-      await ctx.reply("Покупатель отвязан. 👋", { reply_markup: getMainKeyboard(ctx.from.id) });
+    const binding = await Binding.findOne({ ownerId });
+    if (binding) {
+      const oldBuyerId = binding.viewerId;
+      await Binding.deleteOne({ ownerId });
+      await updateUserRole(ownerId);
+      await updateUserRole(oldBuyerId);
+      await ctx.reply("Покупатель отвязан. 👋", { reply_markup: await getMainKeyboard(ctx.from.id) });
     } else {
       await ctx.reply("У тебя нет привязанного покупателя.");
     }
@@ -945,7 +875,7 @@ bot.command("partner", async (ctx) => {
 // ─── Text message handler ─────────────────────────────────────────────────
 bot.on("message:text", async (ctx) => {
   try {
-    ensureUser(ctx);
+    await ensureUser(ctx);
     const text = ctx.message.text;
     const userId = String(ctx.from.id);
     const s = getState(userId);
@@ -989,7 +919,7 @@ bot.on("message:text", async (ctx) => {
       await ctx.reply("🤔 Думаю над идеями...");
       try {
         const idea = await gptGiftIdea(userId);
-        await ctx.reply(idea, { reply_markup: getMainKeyboard(userId) });
+        await ctx.reply(idea, { reply_markup: await getMainKeyboard(userId) });
       } catch (e) {
         console.error("gptGiftIdea error:", e.message);
         await ctx.reply("Не смог придумать идею, попробуй ещё раз 🙈");
@@ -1019,14 +949,13 @@ bot.on("message:text", async (ctx) => {
     }
 
     if (text === "🔓 Отвязать покупателя") {
-      const bindings = getBindings();
-      if (bindings[userId]) {
-        const oldBuyerId = bindings[userId];
-        delete bindings[userId];
-        saveBindings(bindings);
-        updateUserRole(userId);
-        updateUserRole(oldBuyerId);
-        await ctx.reply("Покупатель отвязан. 👋", { reply_markup: getMainKeyboard(userId) });
+      const binding = await Binding.findOne({ ownerId: userId });
+      if (binding) {
+        const oldBuyerId = binding.viewerId;
+        await Binding.deleteOne({ ownerId: userId });
+        await updateUserRole(userId);
+        await updateUserRole(oldBuyerId);
+        await ctx.reply("Покупатель отвязан. 👋", { reply_markup: await getMainKeyboard(userId) });
       } else {
         await ctx.reply("У тебя нет привязанного покупателя.");
       }
@@ -1040,7 +969,7 @@ bot.on("message:text", async (ctx) => {
 
     if (text === "⬅️ Назад") {
       clearState(userId);
-      await ctx.reply("Главное меню:", { reply_markup: getMainKeyboard(userId) });
+      await ctx.reply("Главное меню:", { reply_markup: await getMainKeyboard(userId) });
       return;
     }
 
@@ -1055,27 +984,25 @@ bot.on("message:text", async (ctx) => {
         await ctx.reply("Нельзя привязать самого себя 😄");
         return;
       }
-      const bindings = getBindings();
-      bindings[userId] = input;
-      saveBindings(bindings);
-      updateUserRole(userId);
-      updateUserRole(input);
+      await Binding.findOneAndUpdate({ ownerId: userId }, { viewerId: input }, { upsert: true });
+      await updateUserRole(userId);
+      await updateUserRole(input);
       clearState(userId);
 
       await ctx.reply(
         `Покупатель привязан! 🎉\nID: \`${input}\`\n\nТеперь он будет получать уведомления о новых хотелках.`,
-        { parse_mode: "Markdown", reply_markup: getMainKeyboard(userId) }
+        { parse_mode: "Markdown", reply_markup: await getMainKeyboard(userId) }
       );
 
-      const users = getUsers();
-      const ownerName = users[userId]?.firstName ?? "Партнёр";
+      const owner = await User.findOne({ userId });
+      const ownerName = owner?.firstName ?? "Партнёр";
       try {
         await bot.api.sendMessage(
           input,
           `💝 *${escMd(ownerName)}* привязал(а) тебя как покупателя!\n\n` +
             `Теперь ты будешь получать уведомления о новых хотелках.\n` +
             `Нажми /menu чтобы увидеть обновлённое меню.`,
-          { parse_mode: "Markdown", reply_markup: getMainKeyboard(input) }
+          { parse_mode: "Markdown", reply_markup: await getMainKeyboard(input) }
         );
       } catch { /* buyer hasn't started bot yet */ }
       return;
@@ -1165,7 +1092,6 @@ bot.on("message:text", async (ctx) => {
       if (s.step === "query") {
         const query = text.trim();
 
-        // Якщо введено посилання — завантажуємо товар одразу (без пошуку)
         const isUrl =
           /^https?:\/\//i.test(query) ||
           (/^[\w.-]+\.[a-z]{2,}(\/\S*)?$/i.test(query) && !query.includes(" "));
@@ -1248,7 +1174,7 @@ bot.on("message:text", async (ctx) => {
           const msg = e.message?.includes("SERPAPI_KEY")
             ? "⚠️ SerpAPI ключ не настроен. Добавь SERPAPI_KEY в .env"
             : `⚠️ Ошибка поиска: ${e.message}\nПопробуй ещё раз или добавь вручную.`;
-          await ctx.reply(msg, { reply_markup: getMainKeyboard(userId) });
+          await ctx.reply(msg, { reply_markup: await getMainKeyboard(userId) });
           clearState(userId);
         }
         return;
@@ -1259,27 +1185,26 @@ bot.on("message:text", async (ctx) => {
     if (s.mode === "note" && s.wishId) {
       const note = text.trim();
       if (!note) { await ctx.reply("Заметка не может быть пустой. Напиши что-нибудь:"); return; }
-      const wishes = getWishes();
-      const idx = wishes.findIndex((w) => w.id === s.wishId);
-      if (idx === -1) {
+      const wish = await Wish.findOneAndUpdate(
+        { id: s.wishId },
+        { noteFromBuyer: note, updatedAt: new Date() },
+        { new: true }
+      );
+      if (!wish) {
         await ctx.reply("Хотелка не найдена.");
         clearState(userId);
         return;
       }
-      wishes[idx].noteFromBuyer = note;
-      wishes[idx].updatedAt = new Date().toISOString();
-      saveWishes(wishes);
       clearState(userId);
 
-      await ctx.reply("Заметка сохранена! 📝", { reply_markup: getMainKeyboard(userId) });
+      await ctx.reply("Заметка сохранена! 📝", { reply_markup: await getMainKeyboard(userId) });
 
-      const ownerId = wishes[idx].ownerId;
-      const users = getUsers();
-      const buyerName = users[userId]?.firstName ?? "Покупатель";
+      const buyer = await User.findOne({ userId });
+      const buyerName = buyer?.firstName ?? "Покупатель";
       try {
         await bot.api.sendMessage(
-          ownerId,
-          `📝 *${escMd(buyerName)}* оставил(а) заметку к хотелке *${escMd(wishes[idx].title)}*:\n_${escMd(note)}_`,
+          wish.ownerId,
+          `📝 *${escMd(buyerName)}* оставил(а) заметку к хотелке *${escMd(wish.title)}*:\n_${escMd(note)}_`,
           { parse_mode: "Markdown" }
         );
       } catch { /* owner may be unreachable */ }
@@ -1294,7 +1219,7 @@ bot.on("message:text", async (ctx) => {
     }
 
     // ── Default ───────────────────────────────────────────────────────────
-    await ctx.reply("Используй меню 👇", { reply_markup: getMainKeyboard(userId) });
+    await ctx.reply("Используй меню 👇", { reply_markup: await getMainKeyboard(userId) });
   } catch (e) {
     console.error("message:text error:", e);
     try { await ctx.reply("Что-то пошло не так. Попробуй ещё раз или /cancel"); } catch {}
@@ -1304,7 +1229,7 @@ bot.on("message:text", async (ctx) => {
 // ─── Photo handler ────────────────────────────────────────────────────────
 bot.on("message:photo", async (ctx) => {
   try {
-    ensureUser(ctx);
+    await ensureUser(ctx);
     const userId = String(ctx.from.id);
     const s = getState(userId);
 
@@ -1317,7 +1242,7 @@ bot.on("message:photo", async (ctx) => {
     }
 
     await ctx.reply("Фото получено, но сейчас я его не ожидаю.\nИспользуй меню 👇", {
-      reply_markup: getMainKeyboard(userId),
+      reply_markup: await getMainKeyboard(userId),
     });
   } catch (e) {
     console.error("message:photo error:", e);
@@ -1326,7 +1251,6 @@ bot.on("message:photo", async (ctx) => {
 
 // ─── Callback query handler ───────────────────────────────────────────────
 bot.on("callback_query:data", async (ctx) => {
-  // ALWAYS answer callback query first
   await ctx.answerCallbackQuery();
 
   try {
@@ -1399,7 +1323,7 @@ bot.on("callback_query:data", async (ctx) => {
     // ── Cancel add ─────────────────────────────────────────────────────
     if (data === "cancel_add") {
       clearState(userId);
-      await ctx.reply("Добавление отменено.", { reply_markup: getMainKeyboard(userId) });
+      await ctx.reply("Добавление отменено.", { reply_markup: await getMainKeyboard(userId) });
       return;
     }
 
@@ -1466,7 +1390,8 @@ bot.catch((err) => {
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────
-console.log("🤖 Wishlist bot starting...");
+console.log("Wishlist bot starting...");
+await connectDB();
 bot.start({
   onStart: (info) => console.log(`Bot @${info.username} is running!`),
 });
