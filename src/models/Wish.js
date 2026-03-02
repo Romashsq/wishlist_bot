@@ -23,11 +23,10 @@ const wishSchema = new mongoose.Schema({
 });
 
 // ─── Encrypt before inserting / saving ────────────────────────────────────
-wishSchema.pre("save", function (next) {
+wishSchema.pre("save", function () {
   for (const field of ENCRYPTED_FIELDS) {
     if (this[field] != null) this[field] = encrypt(this[field]);
   }
-  next();
 });
 
 // Decrypt after save so the in-memory doc stays readable

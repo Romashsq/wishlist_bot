@@ -5,6 +5,8 @@ const userSchema = new mongoose.Schema({
   firstName: { type: String, default: "Unknown" },
   role: { type: String, default: "owner" },
   partnerIds: { type: [String], default: [] },
+  lang: { type: String, default: "ru" },
+  langSet: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now },
 });
 

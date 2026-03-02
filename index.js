@@ -1,11 +1,17 @@
 import "dotenv/config";
-import { Bot, InlineKeyboard, Keyboard } from "grammy";
+import { Bot, InlineKeyboard, Keyboard, InputFile } from "grammy";
+import { existsSync } from "fs";
+import { createReadStream } from "fs";
+import { resolve, dirname } from "path";
+import { fileURLToPath } from "url";
+const __dirname = dirname(fileURLToPath(import.meta.url));
 import OpenAI from "openai";
 import crypto from "crypto";
 import { connectDB } from "./src/db/connection.js";
 import User from "./src/models/User.js";
 import Wish from "./src/models/Wish.js";
 import Binding from "./src/models/Binding.js";
+import { t, detectLang } from "./src/i18n/index.js";
 
 // ─── OpenAI ───────────────────────────────────────────────────────────────
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -13,8 +19,9 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 // ─── Bot ──────────────────────────────────────────────────────────────────
 const bot = new Bot(process.env.BOT_TOKEN);
 
-// ─── Доступ к поиску ──────────────────────────────────────────────────────
-const SEARCH_ALLOWED = new Set([458227557, 739105994]);
+// ─── Constants ────────────────────────────────────────────────────────────
+const ADMIN_ID = "458227557";
+const SEARCH_ALLOWED = new Set(["458227557", "739105994"]);
 
 // ─── State machine ────────────────────────────────────────────────────────
 /** @type {Map<string, object>} */
@@ -29,14 +36,46 @@ const clearState = (userId) => userState.delete(String(userId));
 const generateId = () =>
   crypto.randomBytes(6).toString("hex") + "_" + Date.now();
 
+// ─── Language helpers ─────────────────────────────────────────────────────
+function getLang(userId) {
+  return getState(String(userId)).lang ?? "ru";
+}
+
+async function fetchUserLang(userId) {
+  const user = await User.findOne({ userId: String(userId) });
+  return user?.lang ?? "ru";
+}
+
 // ─── User helpers ─────────────────────────────────────────────────────────
 async function ensureUser(ctx) {
   const userId = String(ctx.from.id);
-  await User.findOneAndUpdate(
+  // If lang already loaded this session — skip DB call
+  if (getState(userId).lang) {
+    User.updateOne({ userId }, { $set: { firstName: ctx.from.first_name || "Unknown" } }).catch(() => {});
+    return;
+  }
+  const firstName = ctx.from.first_name || "Unknown";
+  const autoLang = detectLang(ctx.from.language_code);
+  const doc = await User.findOneAndUpdate(
     { userId },
-    { $setOnInsert: { firstName: ctx.from.first_name || "Unknown", role: "owner", partnerIds: [], createdAt: new Date() } },
-    { upsert: true }
+    {
+      $set: { firstName },
+      $setOnInsert: {
+        lang: autoLang,
+        langSet: false,
+        role: "owner",
+        partnerIds: [],
+        createdAt: new Date(),
+      },
+    },
+    { upsert: true, new: true }
   );
+  // If user manually chose a language — respect it; otherwise use Telegram auto-detect
+  const lang = doc.langSet ? (doc.lang ?? autoLang) : autoLang;
+  if (!doc.langSet && doc.lang !== autoLang) {
+    User.updateOne({ userId }, { $set: { lang: autoLang } }).catch(() => {});
+  }
+  setState(userId, { lang });
 }
 
 async function updateUserRole(userId) {
@@ -65,65 +104,83 @@ async function isBuyerUser(userId) {
 
 // ─── Keyboards ───────────────────────────────────────────────────────────
 async function getMainKeyboard(userId) {
+  const lang = getLang(userId);
   const buyer = await isBuyerUser(String(userId));
   const rows = [
-    ["➕ Добавить товар", "🔍 Найти товар"],
-    ["📋 Мои хотелки", "🎁 Идея подарка"],
+    [t(lang, "btn.addProduct"), t(lang, "btn.findProduct")],
+    [t(lang, "btn.myWishes"), t(lang, "btn.giftIdea")],
   ];
-  if (buyer) rows.push(["💝 Что хочет мой партнёр", "🧾 Куплено / История"]);
-  rows.push(["💬 Поболтать", "⚙️ Настройки"]);
+  if (buyer) rows.push([t(lang, "btn.partnerWishes"), t(lang, "btn.history")]);
+  rows.push([t(lang, "btn.chat"), t(lang, "btn.settings"), t(lang, "btn.langSettings")]);
+  rows.push([t(lang, "btn.donate")]);
+  if (String(userId) === ADMIN_ID) rows.push([t(lang, "btn.admin")]);
   return Keyboard.from(rows).resized();
 }
 
-function getSettingsKeyboard() {
+function getSettingsKeyboard(lang) {
   return Keyboard.from([
-    ["🔗 Привязать покупателя", "🔓 Отвязать покупателя"],
-    ["👤 Мой ID"],
-    ["⬅️ Назад"],
+    [t(lang, "btn.bindBuyer"), t(lang, "btn.unbindBuyer")],
+    [t(lang, "btn.myId"), t(lang, "btn.langSettings")],
+    [t(lang, "btn.back")],
   ]).resized();
 }
 
-function getAddMethodKeyboard() {
+function getLangKeyboard() {
   return new InlineKeyboard()
-    .text("📝 Вручную", "add_method:manual")
-    .row()
-    .text("🔗 По ссылке", "add_method:link")
-    .row()
-    .text("🔍 Найти в интернете", "add_method:search");
+    .text("🇷🇺 Русский", "setlang:ru")
+    .text("🇺🇦 Українська", "setlang:uk")
+    .text("🇬🇧 English", "setlang:en");
 }
 
-function getPriorityKeyboard() {
-  return new InlineKeyboard()
-    .text("⭐ 1", "priority_1")
-    .text("⭐⭐ 2", "priority_2")
-    .text("⭐⭐⭐ 3", "priority_3");
+function getAdminKeyboard(lang) {
+  return Keyboard.from([
+    [t(lang, "btn.broadcast"), t(lang, "btn.stats")],
+    [t(lang, "btn.donateBroadcast")],
+    [t(lang, "btn.back")],
+  ]).resized();
 }
 
-function getConfirmKeyboard() {
+function getAddMethodKeyboard(lang) {
   return new InlineKeyboard()
-    .text("✅ Всё верно", "confirm_add")
-    .text("✏️ Редактировать", "edit_add")
+    .text(t(lang, "ibtn.addManual"), "add_method:manual")
     .row()
-    .text("❌ Отмена", "cancel_add");
+    .text(t(lang, "ibtn.addByLink"), "add_method:link")
+    .row()
+    .text(t(lang, "ibtn.addBySearch"), "add_method:search");
 }
 
-function getBuyerWishKeyboard(wishId) {
+function getPriorityKeyboard(lang) {
   return new InlineKeyboard()
-    .text("✅ Куплено", `mark_bought:${wishId}`)
-    .text("🛒 Возьму", `mark_planned:${wishId}`)
+    .text(t(lang, "ibtn.priority1"), "priority_1")
+    .text(t(lang, "ibtn.priority2"), "priority_2")
+    .text(t(lang, "ibtn.priority3"), "priority_3");
+}
+
+function getConfirmKeyboard(lang) {
+  return new InlineKeyboard()
+    .text(t(lang, "ibtn.confirmAdd"), "confirm_add")
+    .text(t(lang, "ibtn.editAdd"), "edit_add")
     .row()
-    .text("💤 Отложить", `mark_archived:${wishId}`)
-    .text("📝 Заметка", `note:${wishId}`);
+    .text(t(lang, "ibtn.cancelAdd"), "cancel_add");
+}
+
+function getBuyerWishKeyboard(wishId, lang) {
+  return new InlineKeyboard()
+    .text(t(lang, "ibtn.markBought"), `mark_bought:${wishId}`)
+    .text(t(lang, "ibtn.markPlanned"), `mark_planned:${wishId}`)
+    .row()
+    .text(t(lang, "ibtn.markArchived"), `mark_archived:${wishId}`)
+    .text(t(lang, "ibtn.addNote"), `note:${wishId}`);
 }
 
 // ─── Caption builder ──────────────────────────────────────────────────────
-function wishCaption(wish, forBuyer = false) {
+function wishCaption(wish, lang, forBuyer = false) {
   const stars = "⭐".repeat(wish.priority || 1);
   const statusMap = {
-    new: "🆕 Новое",
-    planned: "🛒 Планируется",
-    bought: "✅ Куплено",
-    archived: "💤 Отложено",
+    new:      t(lang, "status.new"),
+    planned:  t(lang, "status.planned"),
+    bought:   t(lang, "status.bought"),
+    archived: t(lang, "status.archived"),
   };
   let text = `*${escMd(wish.title)}*\n`;
   text += `${stars} Приоритет\n`;
@@ -139,9 +196,9 @@ function escMd(str) {
   return String(str ?? "").replace(/[_*[\]()~`>#+\-=|{}.!]/g, "\\$&");
 }
 
-// ─── Send wish card helper (supports both photoFileId and photoUrl) ────────
-async function sendWishCard(target, chatId, wish, keyboard, forBuyer = false) {
-  const caption = wishCaption(wish, forBuyer);
+// ─── Send wish card helper ────────────────────────────────────────────────
+async function sendWishCard(target, chatId, wish, keyboard, lang, forBuyer = false) {
+  const caption = wishCaption(wish, lang, forBuyer);
   const msgOpts = { parse_mode: "Markdown", ...(keyboard ? { reply_markup: keyboard } : {}) };
   const photo = wish.photoFileId || wish.photoUrl || null;
 
@@ -166,32 +223,32 @@ async function sendWishCard(target, chatId, wish, keyboard, forBuyer = false) {
 }
 
 // ─── Build & send confirm preview ────────────────────────────────────────
-async function sendConfirmPreview(ctx, s) {
+async function sendConfirmPreview(ctx, s, lang) {
   const priority = s.priority ?? 2;
-  const preview =
-    `*${escMd(s.title ?? "Без названия")}*\n` +
-    `${"⭐".repeat(priority)} Приоритет\n` +
-    `💰 ${escMd(s.price ?? "Не указана")}\n` +
-    (s.link ? `🔗 [Ссылка](${s.link})\n` : "") +
-    `Статус: 🆕 Новое\n\n_Всё верно?_`;
+  const titleLine = `*${escMd(s.title ?? t(lang, "msg.untitled"))}*`;
+  const priceLine = `💰 ${escMd(s.price ?? t(lang, "msg.priceUnknown"))}`;
+  const priorityLine = `${"⭐".repeat(priority)} Приоритет`;
+  const linkLine = s.link ? `🔗 ${escMd(s.link)}` : "";
+  const statusLine = `Статус: ${t(lang, "status.new")}`;
+  const preview = [titleLine, priorityLine, priceLine, linkLine, statusLine, "", "_Всё верно?_"]
+    .filter(Boolean).join("\n");
 
+  const keyboard = getConfirmKeyboard(lang);
   const photo = s.photoFileId || s.photoUrl || null;
+
   if (photo) {
     try {
-      await ctx.replyWithPhoto(photo, {
-        caption: preview,
-        parse_mode: "Markdown",
-        reply_markup: getConfirmKeyboard(),
-      });
+      await ctx.replyWithPhoto(photo, { caption: preview, parse_mode: "Markdown", reply_markup: keyboard });
       return;
-    } catch {
-      // fall through
-    }
+    } catch { /* photo failed, fall through to text */ }
   }
-  await ctx.reply(preview, {
-    parse_mode: "Markdown",
-    reply_markup: getConfirmKeyboard(),
-  });
+  try {
+    await ctx.reply(preview, { parse_mode: "Markdown", reply_markup: keyboard });
+  } catch {
+    // Markdown failed — send plain text
+    const plain = `${s.title ?? "?"}\n⭐x${priority}  💰 ${s.price ?? "?"}${s.link ? "\n" + s.link : ""}`;
+    await ctx.reply(plain, { reply_markup: keyboard });
+  }
 }
 
 // ─── GPT helpers ─────────────────────────────────────────────────────────
@@ -242,7 +299,6 @@ YOUR TASKS:
 
 LANGUAGE RULE (CRITICAL):
 - Detect the language of the user's message and ALWAYS reply in the SAME language
-- Supported: Ukrainian, Russian, English, Polish, German, French, Spanish, or any other language the user writes in
 - Never switch languages mid-conversation unless the user does
 
 STYLE RULES:
@@ -266,7 +322,6 @@ STYLE RULES:
   return reply;
 }
 
-/** GPT: запропонуй ідею подарунка з урахуванням вишліста */
 async function gptGiftIdea(userId) {
   const ownerId = (await getOwnerId(userId)) || userId;
   const wishes = await Wish.find({ ownerId, status: { $ne: "archived" } });
@@ -287,7 +342,6 @@ async function gptGiftIdea(userId) {
   ]);
 }
 
-/** GPT → {query} для пошуку товару на Google Shopping */
 async function gptBuildSearchQuery(userInput) {
   const raw = await gptRequest([
     {
@@ -309,7 +363,7 @@ async function gptBuildSearchQuery(userInput) {
   }
 }
 
-// ─── Scraper: extract product from URL ───────────────────────────────────
+// ─── Scraper ──────────────────────────────────────────────────────────────
 async function fetchProductData(url) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 12000);
@@ -335,12 +389,8 @@ async function fetchProductData(url) {
     clearTimeout(timer);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const html = await res.text();
-
-    // Try fast HTML parsing first
     const fast = parseProductFromHtml(html, url);
     if (fast && fast.title && fast.image) return fast;
-
-    // GPT fallback for JS-heavy sites (Zara, Bershka, etc.)
     return await gptExtractProduct(html, url);
   } catch (e) {
     clearTimeout(timer);
@@ -349,7 +399,6 @@ async function fetchProductData(url) {
 }
 
 function parseProductFromHtml(html, sourceUrl) {
-  // A) JSON-LD schema.org Product
   const ldRe = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
   let ldMatch;
   while ((ldMatch = ldRe.exec(html)) !== null) {
@@ -360,12 +409,9 @@ function parseProductFromHtml(html, sourceUrl) {
         const product = findProductInLd(item);
         if (product) return { ...product, link: sourceUrl, source: "jsonld" };
       }
-    } catch {
-      /* skip malformed JSON-LD */
-    }
+    } catch { /* skip */ }
   }
 
-  // B) __NEXT_DATA__ (Next.js: Zara, Bershka, Reserved, etc.)
   const nextDataM = html.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
   if (nextDataM) {
     try {
@@ -375,7 +421,6 @@ function parseProductFromHtml(html, sourceUrl) {
     } catch { /* skip */ }
   }
 
-  // C) OpenGraph
   const ogTitle = ogMeta(html, "og:title") || htmlTitle(html);
   const ogImage = ogMeta(html, "og:image");
   const ogPrice =
@@ -387,7 +432,6 @@ function parseProductFromHtml(html, sourceUrl) {
     return { title: ogTitle, image: ogImage, price: ogPrice, link: sourceUrl, source: "og" };
   }
 
-  // D) Fallback: <title> + first img src
   const title = htmlTitle(html);
   const imgM = html.match(/<img[^>]+src=["']([^"']{10,})["'][^>]*/i);
   if (imgM) {
@@ -395,15 +439,11 @@ function parseProductFromHtml(html, sourceUrl) {
     if (!img.startsWith("http")) {
       try { img = new URL(img, sourceUrl).href; } catch { img = null; }
     }
-    if (title && img) {
-      return { title, image: img, price: null, link: sourceUrl, source: "fallback" };
-    }
+    if (title && img) return { title, image: img, price: null, link: sourceUrl, source: "fallback" };
   }
-
   return null;
 }
 
-/** Рекурсивний пошук продукту в JSON-LD об'єкті (вкладені @graph тощо) */
 function findProductInLd(obj) {
   if (!obj || typeof obj !== "object") return null;
   if (obj["@type"] === "Product" || (Array.isArray(obj["@type"]) && obj["@type"].includes("Product"))) {
@@ -418,26 +458,20 @@ function findProductInLd(obj) {
     }
     if (title && image) return { title, image: String(image), price };
   }
-  // Recurse into arrays and nested objects
   for (const val of Object.values(obj)) {
     if (Array.isArray(val)) {
-      for (const el of val) {
-        const r = findProductInLd(el);
-        if (r) return r;
-      }
+      for (const el of val) { const r = findProductInLd(el); if (r) return r; }
     } else if (val && typeof val === "object") {
-      const r = findProductInLd(val);
-      if (r) return r;
+      const r = findProductInLd(val); if (r) return r;
     }
   }
   return null;
 }
 
-/** Шукає name/price/image в довільному JSON об'єкті (Next.js pageProps) */
 function findProductInObj(obj, depth) {
   if (depth > 6 || !obj || typeof obj !== "object") return null;
   const keys = Object.keys(obj);
-  const hasName = keys.some((k) => k === "name" || k === "title" || k === "productName");
+  const hasName  = keys.some((k) => k === "name" || k === "title" || k === "productName");
   const hasPrice = keys.some((k) => ["price", "salePrice", "currentPrice", "offers"].includes(k));
   const hasImage = keys.some((k) => ["image", "images", "thumbnail", "photo", "mediaSet"].includes(k));
   if (hasName && (hasPrice || hasImage)) {
@@ -457,19 +491,14 @@ function findProductInObj(obj, depth) {
   }
   for (const val of Object.values(obj)) {
     if (Array.isArray(val)) {
-      for (const el of val) {
-        const r = findProductInObj(el, depth + 1);
-        if (r) return r;
-      }
+      for (const el of val) { const r = findProductInObj(el, depth + 1); if (r) return r; }
     } else if (val && typeof val === "object") {
-      const r = findProductInObj(val, depth + 1);
-      if (r) return r;
+      const r = findProductInObj(val, depth + 1); if (r) return r;
     }
   }
   return null;
 }
 
-/** Витягує найбільш релевантну частину HTML для GPT */
 function extractRelevantHtml(html) {
   const parts = [];
   const titleM = html.match(/<title[^>]*>([^<]{1,300})<\/title>/i);
@@ -484,7 +513,6 @@ function extractRelevantHtml(html) {
   return parts.join("\n").slice(0, 8000);
 }
 
-/** GPT витягує назву/ціну/зображення коли HTML-парсинг не спрацював */
 async function gptExtractProduct(html, url) {
   try {
     const relevant = extractRelevantHtml(html);
@@ -495,8 +523,7 @@ async function gptExtractProduct(html, url) {
         content:
           "Ти парсер товарних сторінок. З наданого HTML витягни інформацію про товар.\n" +
           "Верни ТІЛЬКИ JSON (без markdown): {\"title\":\"назва\",\"price\":\"ціна з валютою\",\"image\":\"https://...\"}\n" +
-          "Якщо поле не знайдено — null. Ціну пиши як є (наприклад: 1299 UAH або 49.99 EUR).\n" +
-          "image має бути повним URL зображення товару.",
+          "Якщо поле не знайдено — null.",
       },
       { role: "user", content: `URL: ${url}\n\nHTML:\n${relevant}` },
     ]);
@@ -516,10 +543,7 @@ function ogMeta(html, prop) {
     new RegExp(`<meta[^>]+name=["']${prop}["'][^>]+content=["']([^"']+)["']`, "i"),
     new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+name=["']${prop}["']`, "i"),
   ];
-  for (const re of patterns) {
-    const m = html.match(re);
-    if (m) return m[1].trim();
-  }
+  for (const re of patterns) { const m = html.match(re); if (m) return m[1].trim(); }
   return null;
 }
 
@@ -528,34 +552,27 @@ function htmlTitle(html) {
   return m ? m[1].trim() : null;
 }
 
-// ─── SerpAPI Google Shopping ──────────────────────────────────────────────
-
+// ─── SerpAPI ──────────────────────────────────────────────────────────────
 const TRUSTED_GLOBAL = [
-  "asos", "zalando", "farfetch", "amazon", "ebay",
-  "ssense", "mytheresa", "net-a-porter", "matchesfashion",
-  "zara.com", "bershka.com", "mango.com", "hm.com", "uniqlo.com",
-  "reserved.com", "sinsay.com", "cropp.com", "pullandbear.com",
-  "massimodutti.com", "guess.com", "calzedonia.com", "intimissimi.com",
-  "mohito.com", "parfois.com", "terranova.com", "lc-waikiki.com",
-  "tommy.com", "calvinklein.com", "lacoste.com", "polo.com",
-  "nike.com", "adidas.com", "puma.com", "newbalance.com",
-  "reebok.com", "converse.com", "underarmour.com", "asics.com",
-  "skechers.com", "vans.com", "timberland.com",
-  "apple.com", "samsung.com", "sony.com", "dyson.com",
-  "philips.com", "xiaomi.com", "lg.com",
-  "sephora.com", "lookfantastic.com", "douglas.ua",
-  "mac-cosmetics.com", "nars.com", "lancome.com", "theordinary.com",
-  "ikea.com", "leroy-merlin",
-  "decathlon",
+  "asos", "zalando", "farfetch", "amazon", "ebay", "ssense", "mytheresa",
+  "net-a-porter", "matchesfashion", "zara.com", "bershka.com", "mango.com",
+  "hm.com", "uniqlo.com", "reserved.com", "sinsay.com", "cropp.com",
+  "pullandbear.com", "massimodutti.com", "guess.com", "calzedonia.com",
+  "intimissimi.com", "mohito.com", "parfois.com", "terranova.com",
+  "lc-waikiki.com", "tommy.com", "calvinklein.com", "lacoste.com", "polo.com",
+  "nike.com", "adidas.com", "puma.com", "newbalance.com", "reebok.com",
+  "converse.com", "underarmour.com", "asics.com", "skechers.com", "vans.com",
+  "timberland.com", "apple.com", "samsung.com", "sony.com", "dyson.com",
+  "philips.com", "xiaomi.com", "lg.com", "sephora.com", "lookfantastic.com",
+  "douglas.ua", "mac-cosmetics.com", "nars.com", "lancome.com",
+  "theordinary.com", "ikea.com", "leroy-merlin", "decathlon",
 ];
-
 const UA_STORES = [
-  "rozetka", "prom.ua", "allo", "epicentrk", "kasta",
-  "comfy", "foxtrot", "citrus", "stylus", "brain.com.ua",
-  "makeup.com.ua", "makeup", "parfums", "prostor", "brocard",
-  "intertop", "answear", "lamoda.ua", "modna", "leboutique",
-  "shafa", "maudau", "sportmaster", "intersport",
-  "yakaboo", "bodo", "antoshka",
+  "rozetka", "prom.ua", "allo", "epicentrk", "kasta", "comfy", "foxtrot",
+  "citrus", "stylus", "brain.com.ua", "makeup.com.ua", "makeup", "parfums",
+  "prostor", "brocard", "intertop", "answear", "lamoda.ua", "modna",
+  "leboutique", "shafa", "maudau", "sportmaster", "intersport", "yakaboo",
+  "bodo", "antoshka",
 ];
 
 function rankResult(item) {
@@ -569,14 +586,12 @@ function rankResult(item) {
 async function searchGoogleShopping(query) {
   const key = process.env.SERPAPI_KEY;
   if (!key) throw new Error("SERPAPI_KEY не задан в .env");
-
   const url = new URL("https://serpapi.com/search.json");
   url.searchParams.set("engine", "google_shopping");
   url.searchParams.set("q", query);
   url.searchParams.set("api_key", key);
   url.searchParams.set("hl", "ru");
   url.searchParams.set("num", "20");
-
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 12000);
   try {
@@ -585,84 +600,75 @@ async function searchGoogleShopping(query) {
     if (!res.ok) throw new Error(`SerpAPI HTTP ${res.status}`);
     const data = await res.json();
     if (data.error) throw new Error(data.error);
-
     const all = data.shopping_results || [];
     const ranked = [...all].sort((a, b) => rankResult(a) - rankResult(b));
-    const filtered = ranked.filter((r) => r.title && (r.source || r.link));
-    return filtered.slice(0, 5);
+    return ranked.filter((r) => r.title && (r.source || r.link)).slice(0, 5);
   } catch (e) {
     clearTimeout(timer);
     throw e;
   }
 }
 
-// ─── Business logic helpers ───────────────────────────────────────────────
-async function showOwnerWishes(ctx) {
+// ─── Business logic ───────────────────────────────────────────────────────
+async function showOwnerWishes(ctx, lang) {
   const ownerId = String(ctx.from.id);
   const wishes = await Wish.find({ ownerId, status: { $ne: "archived" } }).sort({ createdAt: 1 });
   if (wishes.length === 0) {
-    await ctx.reply("У тебя пока нет хотелок. Добавь первую! ➕");
+    await ctx.reply(t(lang, "msg.noWishes"));
     return;
   }
   const slice = wishes.slice(-10);
-  await ctx.reply(`📋 *Твои хотелки* (${slice.length}):`, { parse_mode: "Markdown" });
-  for (const wish of slice) {
-    await sendWishCard(ctx, ownerId, wish, undefined, false);
-  }
+  await ctx.reply(t(lang, "msg.myWishesHeader", { count: slice.length }), { parse_mode: "Markdown" });
+  for (const wish of slice) await sendWishCard(ctx, ownerId, wish, undefined, lang, false);
 }
 
-async function showPartnerWishes(ctx) {
+async function showPartnerWishes(ctx, lang) {
   const buyerId = String(ctx.from.id);
   const ownerId = await getOwnerId(buyerId);
   if (!ownerId) {
-    await ctx.reply(
-      "Тебя ещё никто не привязал как покупателя 😔\nПопроси партнёра выполнить /bind и ввести твой ID."
-    );
+    await ctx.reply(t(lang, "msg.notBoundAsBuyer"));
     return;
   }
   const wishes = await Wish.find({ ownerId, status: { $ne: "archived" } }).sort({ createdAt: 1 });
   if (wishes.length === 0) {
-    await ctx.reply("У партнёра пока нет активных хотелок 🎉");
+    await ctx.reply(t(lang, "msg.noPartnerWishes"));
     return;
   }
   const slice = wishes.slice(-10);
-  await ctx.reply(`💝 *Хотелки партнёра* (${slice.length}):`, { parse_mode: "Markdown" });
-  for (const wish of slice) {
-    await sendWishCard(ctx, buyerId, wish, getBuyerWishKeyboard(wish.id), true);
-  }
+  await ctx.reply(t(lang, "msg.partnerWishesHeader", { count: slice.length }), { parse_mode: "Markdown" });
+  for (const wish of slice) await sendWishCard(ctx, buyerId, wish, getBuyerWishKeyboard(wish.id, lang), lang, true);
 }
 
-async function showBuyerHistory(ctx) {
+async function showBuyerHistory(ctx, lang) {
   const buyerId = String(ctx.from.id);
   const ownerId = await getOwnerId(buyerId);
   if (!ownerId) {
-    await ctx.reply("Тебя ещё никто не привязал как покупателя.");
+    await ctx.reply(t(lang, "msg.notBoundSimple"));
     return;
   }
   const wishes = await Wish.find({ ownerId, status: "bought" }).sort({ updatedAt: -1 });
   if (wishes.length === 0) {
-    await ctx.reply("Ещё ничего не куплено. Держись! 💪");
+    await ctx.reply(t(lang, "msg.noBought"));
     return;
   }
   const slice = wishes.slice(0, 10);
-  await ctx.reply(`🧾 *Куплено* (${slice.length}):`, { parse_mode: "Markdown" });
-  for (const wish of slice) {
-    await sendWishCard(ctx, buyerId, wish, undefined, true);
-  }
+  await ctx.reply(t(lang, "msg.boughtHeader", { count: slice.length }), { parse_mode: "Markdown" });
+  for (const wish of slice) await sendWishCard(ctx, buyerId, wish, undefined, lang, true);
 }
 
-async function updateWishStatus(ctx, buyerId, wishId, status) {
+async function updateWishStatus(ctx, buyerId, wishId, status, lang) {
   const wish = await Wish.findOneAndUpdate(
     { id: wishId },
     { status, updatedAt: new Date() },
     { new: true }
   );
-  if (!wish) {
-    await ctx.reply("Хотелка не найдена.");
-    return;
-  }
+  if (!wish) { await ctx.reply(t(lang, "msg.wishNotFound")); return; }
 
-  const statusLabel = { bought: "✅ Куплено", planned: "🛒 Планируется", archived: "💤 Отложено" };
+  const statusLabel = {
+    bought:   t(lang, "status.bought"),
+    planned:  t(lang, "status.planned"),
+    archived: t(lang, "status.archived"),
+  };
   await ctx.reply(
     `${statusLabel[status] ?? status}: *${escMd(wish.title)}*`,
     { parse_mode: "Markdown" }
@@ -670,28 +676,29 @@ async function updateWishStatus(ctx, buyerId, wishId, status) {
 
   const buyer = await User.findOne({ userId: buyerId });
   const buyerName = buyer?.firstName ?? "Покупатель";
-  const actionLabel = { bought: "купил(а)", planned: "планирует купить", archived: "отложил(а)" };
+  const ownerLang = await fetchUserLang(wish.ownerId);
   try {
     await bot.api.sendMessage(
       wish.ownerId,
-      `💝 *${escMd(buyerName)}* ${actionLabel[status] ?? "обновил(а) статус"} хотелки *${escMd(wish.title)}*`,
+      t(ownerLang, "msg.buyerAction", {
+        buyerName: escMd(buyerName),
+        action: t(ownerLang, `action.${status}`),
+        title: escMd(wish.title),
+      }),
       { parse_mode: "Markdown" }
     );
-  } catch {
-    // owner may be unreachable
-  }
+  } catch { /* owner may be unreachable */ }
 }
 
-/** Finalize and persist a wish from state, notify buyer */
-async function finalizeWish(ctx, userId, s) {
+async function finalizeWish(ctx, userId, s, lang) {
   const buyerId = await getBuyerId(userId);
   const wish = new Wish({
     id: generateId(),
     ownerId: userId,
     buyerId: buyerId ?? null,
-    title: s.title ?? "Без названия",
+    title: s.title ?? t(lang, "msg.untitled"),
     link: s.link ?? "",
-    price: s.price ?? "Не указана",
+    price: s.price ?? t(lang, "msg.priceUnknown"),
     photoFileId: s.photoFileId ?? null,
     photoUrl: s.photoUrl ?? null,
     priority: s.priority ?? 2,
@@ -700,42 +707,46 @@ async function finalizeWish(ctx, userId, s) {
     createdAt: new Date(),
     updatedAt: new Date(),
   });
-  await wish.save();
+  try {
+    await wish.save();
+  } catch (e) {
+    const errText = e.message ?? String(e);
+    console.error("wish.save() error:", errText);
+    try { await bot.api.sendMessage(ADMIN_ID, `⚠️ wish.save() error (user ${userId}):\n${errText}`); } catch {}
+    await ctx.reply(t(lang, "msg.error"));
+    return;
+  }
   clearState(userId);
 
-  const gptComment = await gptWishComment(wish.title);
-  await ctx.reply(`✅ Хотелка сохранена!\n\n${gptComment}`, {
+  let gptComment = "";
+  try { gptComment = await gptWishComment(wish.title); } catch {}
+  await ctx.reply(t(lang, "msg.wishSaved", { comment: gptComment }), {
     reply_markup: await getMainKeyboard(userId),
   });
 
   if (buyerId) {
-    const caption = wishCaption(wish, true) + "\n\n✨ *Новая хотелка от партнёра!*";
+    const buyerLang = await fetchUserLang(buyerId);
+    const caption = wishCaption(wish, buyerLang, true) + `\n\n${t(buyerLang, "msg.newWishFor")}`;
     const photo = wish.photoFileId || wish.photoUrl;
     try {
       if (photo) {
         await bot.api.sendPhoto(buyerId, photo, {
           caption,
           parse_mode: "Markdown",
-          reply_markup: getBuyerWishKeyboard(wish.id),
+          reply_markup: getBuyerWishKeyboard(wish.id, buyerLang),
         });
       } else {
         await bot.api.sendMessage(buyerId, caption, {
           parse_mode: "Markdown",
-          reply_markup: getBuyerWishKeyboard(wish.id),
+          reply_markup: getBuyerWishKeyboard(wish.id, buyerLang),
         });
       }
     } catch (e) {
       const errCode = e?.error_code ?? e?.payload?.error_code;
       const errDesc = String(e?.description ?? e?.message ?? "");
-      const isBlocked =
-        errCode === 403 ||
-        errDesc.includes("blocked") ||
-        errDesc.includes("bot was blocked");
+      const isBlocked = errCode === 403 || errDesc.includes("blocked") || errDesc.includes("bot was blocked");
       if (isBlocked) {
-        await ctx.reply(
-          "⚠️ Не смог отправить уведомление покупателю.\n" +
-            "Пусть он нажмёт /start у бота, чтобы активировать его."
-        );
+        await ctx.reply(t(lang, "msg.cantNotifyBuyer"));
       } else {
         console.error("notify buyer error:", e.message ?? e);
       }
@@ -745,131 +756,126 @@ async function finalizeWish(ctx, userId, s) {
 
 // ─── Register bot commands ─────────────────────────────────────────────────
 await bot.api.setMyCommands([
-  { command: "start", description: "Запуск бота / главное меню" },
-  { command: "menu", description: "Показать меню" },
-  { command: "myid", description: "Показать мой Telegram ID" },
-  { command: "bind", description: "Привязать покупателя" },
-  { command: "unbind", description: "Отвязать покупателя" },
-  { command: "wishes", description: "Мои хотелки" },
+  { command: "start",   description: "Запуск бота / главное меню" },
+  { command: "menu",    description: "Показать меню" },
+  { command: "myid",    description: "Показать мой Telegram ID" },
+  { command: "bind",    description: "Привязать покупателя" },
+  { command: "unbind",  description: "Отвязать покупателя" },
+  { command: "wishes",  description: "Мои хотелки" },
   { command: "partner", description: "Хотелки партнёра" },
-  { command: "cancel", description: "Отмена текущего действия" },
-  { command: "help", description: "Справка" },
+  { command: "cancel",  description: "Отмена текущего действия" },
+  { command: "help",    description: "Справка" },
 ]);
 
 // ─── /start ───────────────────────────────────────────────────────────────
 bot.command("start", async (ctx) => {
   try {
     await ensureUser(ctx);
-    clearState(ctx.from.id);
+    const userId = String(ctx.from.id);
+    clearState(userId);
+    const lang = getLang(userId);
     const name = ctx.from.first_name || "друг";
-    await ctx.reply(
-      `Привет, *${escMd(name)}*! 💕\n\nЯ — бот-вишлист для вашей пары.\n` +
-        `Добавляй хотелки, а партнёр будет знать, что тебе подарить 🎁\n\n` +
-        `Используй меню ниже 👇`,
-      { parse_mode: "Markdown", reply_markup: await getMainKeyboard(ctx.from.id) }
-    );
-  } catch (e) {
-    console.error("/start error:", e);
-  }
+    const caption = t(lang, "msg.start", { name: escMd(name) });
+    const keyboard = await getMainKeyboard(userId);
+
+    // Try to send logo if present
+    const logoCandidates = ["logo.png", "logo.jpg", "logo.jpeg", "logo.webp"].map(f => resolve(__dirname, f));
+    const logoPath = logoCandidates.find(p => existsSync(p));
+    if (logoPath) {
+      await ctx.replyWithPhoto(new InputFile(createReadStream(logoPath)), {
+        caption,
+        parse_mode: "Markdown",
+        reply_markup: keyboard,
+      });
+    } else {
+      await ctx.reply(caption, { parse_mode: "Markdown", reply_markup: keyboard });
+    }
+  } catch (e) { console.error("/start error:", e); }
 });
 
 // ─── /menu ────────────────────────────────────────────────────────────────
 bot.command("menu", async (ctx) => {
   try {
     await ensureUser(ctx);
-    await ctx.reply("Главное меню:", { reply_markup: await getMainKeyboard(ctx.from.id) });
-  } catch (e) {
-    console.error("/menu error:", e);
-  }
+    const userId = String(ctx.from.id);
+    const lang = getLang(userId);
+    await ctx.reply(t(lang, "msg.menu"), { reply_markup: await getMainKeyboard(userId) });
+  } catch (e) { console.error("/menu error:", e); }
 });
 
 // ─── /myid ────────────────────────────────────────────────────────────────
 bot.command("myid", async (ctx) => {
   try {
-    await ctx.reply(`Твой Telegram ID: \`${ctx.from.id}\``, { parse_mode: "Markdown" });
-  } catch (e) {
-    console.error("/myid error:", e);
-  }
+    await ensureUser(ctx);
+    const lang = getLang(String(ctx.from.id));
+    await ctx.reply(t(lang, "msg.myId", { id: ctx.from.id }), { parse_mode: "Markdown" });
+  } catch (e) { console.error("/myid error:", e); }
 });
 
 // ─── /help ────────────────────────────────────────────────────────────────
 bot.command("help", async (ctx) => {
   try {
-    await ctx.reply(
-      `*Справка — Wishlist для пары 💝*\n\n` +
-        `*Для создателя:*\n` +
-        `➕ Добавить товар:\n` +
-        `  📝 Вручную — фото → название → ссылка → цена → приоритет\n` +
-        `  🔗 По ссылке — вставь URL, бот извлечёт данные сам\n` +
-        `  🔍 Найти в интернете — опиши товар, бот найдёт варианты\n` +
-        `📋 Мои хотелки — список желаний\n\n` +
-        `*Для покупателя:*\n` +
-        `💝 Что хочет мой партнёр — активные хотелки\n` +
-        `🧾 Куплено / История — купленные товары\n\n` +
-        `*Команды:*\n` +
-        `/myid — узнать свой ID\n` +
-        `/bind — привязать покупателя\n` +
-        `/unbind — отвязать покупателя\n` +
-        `/cancel — отмена текущего действия\n` +
-        `/wishes — мои хотелки\n` +
-        `/partner — хотелки партнёра`,
-      { parse_mode: "Markdown" }
-    );
-  } catch (e) {
-    console.error("/help error:", e);
-  }
+    await ensureUser(ctx);
+    const lang = getLang(String(ctx.from.id));
+    await ctx.reply(t(lang, "msg.help"), { parse_mode: "Markdown" });
+  } catch (e) { console.error("/help error:", e); }
 });
 
 // ─── /cancel ──────────────────────────────────────────────────────────────
 bot.command("cancel", async (ctx) => {
   try {
-    clearState(ctx.from.id);
-    await ctx.reply("Действие отменено.", { reply_markup: await getMainKeyboard(ctx.from.id) });
-  } catch (e) {
-    console.error("/cancel error:", e);
-  }
+    await ensureUser(ctx);
+    const userId = String(ctx.from.id);
+    const lang = getLang(userId);
+    clearState(userId);
+    setState(userId, { lang });
+    await ctx.reply(t(lang, "msg.cancelled"), { reply_markup: await getMainKeyboard(userId) });
+  } catch (e) { console.error("/cancel error:", e); }
 });
 
 // ─── /bind ────────────────────────────────────────────────────────────────
 bot.command("bind", async (ctx) => {
   try {
     await ensureUser(ctx);
-    setState(ctx.from.id, { mode: "bind" });
-    await ctx.reply(
-      "Введи Telegram ID покупателя (только цифры).\n\n" +
-        "Чтобы узнать ID — пусть партнёр напишет /myid боту."
-    );
-  } catch (e) {
-    console.error("/bind error:", e);
-  }
+    const userId = String(ctx.from.id);
+    const lang = getLang(userId);
+    setState(userId, { mode: "bind" });
+    await ctx.reply(t(lang, "msg.enterBuyerIdFull"));
+  } catch (e) { console.error("/bind error:", e); }
 });
 
 // ─── /unbind ──────────────────────────────────────────────────────────────
 bot.command("unbind", async (ctx) => {
   try {
-    const ownerId = String(ctx.from.id);
-    const binding = await Binding.findOne({ ownerId });
+    await ensureUser(ctx);
+    const userId = String(ctx.from.id);
+    const lang = getLang(userId);
+    const binding = await Binding.findOne({ ownerId: userId });
     if (binding) {
       const oldBuyerId = binding.viewerId;
-      await Binding.deleteOne({ ownerId });
-      await updateUserRole(ownerId);
+      await Binding.deleteOne({ ownerId: userId });
+      await updateUserRole(userId);
       await updateUserRole(oldBuyerId);
-      await ctx.reply("Покупатель отвязан. 👋", { reply_markup: await getMainKeyboard(ctx.from.id) });
+      await ctx.reply(t(lang, "msg.buyerUnbound"), { reply_markup: await getMainKeyboard(userId) });
     } else {
-      await ctx.reply("У тебя нет привязанного покупателя.");
+      await ctx.reply(t(lang, "msg.noBuyer"));
     }
-  } catch (e) {
-    console.error("/unbind error:", e);
-  }
+  } catch (e) { console.error("/unbind error:", e); }
 });
 
 // ─── /wishes & /partner ───────────────────────────────────────────────────
 bot.command("wishes", async (ctx) => {
-  try { await showOwnerWishes(ctx); } catch (e) { console.error("/wishes error:", e); }
+  try {
+    await ensureUser(ctx);
+    await showOwnerWishes(ctx, getLang(String(ctx.from.id)));
+  } catch (e) { console.error("/wishes error:", e); }
 });
 
 bot.command("partner", async (ctx) => {
-  try { await showPartnerWishes(ctx); } catch (e) { console.error("/partner error:", e); }
+  try {
+    await ensureUser(ctx);
+    await showPartnerWishes(ctx, getLang(String(ctx.from.id)));
+  } catch (e) { console.error("/partner error:", e); }
 });
 
 // ─── Text message handler ─────────────────────────────────────────────────
@@ -878,173 +884,275 @@ bot.on("message:text", async (ctx) => {
     await ensureUser(ctx);
     const text = ctx.message.text;
     const userId = String(ctx.from.id);
+    const lang = getLang(userId);
     const s = getState(userId);
 
-    // ── Reply keyboard buttons ─────────────────────────────────────────
-    if (text === "➕ Добавить товар") {
-      clearState(userId);
-      setState(userId, { mode: "add_method" });
-      await ctx.reply("Как добавим хотелку? 🛍️", {
-        reply_markup: getAddMethodKeyboard(),
+    // ── Admin panel ───────────────────────────────────────────────────────
+    if (text === t(lang, "btn.admin") && userId === ADMIN_ID) {
+      await ctx.reply(t(lang, "msg.adminPanel"), {
+        parse_mode: "Markdown",
+        reply_markup: getAdminKeyboard(lang),
       });
       return;
     }
 
-    if (text === "📋 Мои хотелки") { await showOwnerWishes(ctx); return; }
-    if (text === "💝 Что хочет мой партнёр") { await showPartnerWishes(ctx); return; }
-    if (text === "🧾 Куплено / История") { await showBuyerHistory(ctx); return; }
-
-    if (text === "🔍 Найти товар") {
-      if (!SEARCH_ALLOWED.has(userId)) {
-        await ctx.reply("⛔ У вас нет доступа к поиску.");
-        return;
-      }
-      if (!process.env.SERPAPI_KEY) {
-        await ctx.reply(
-          "⚠️ Поиск недоступен — не задан SERPAPI_KEY в .env\n" +
-            "Получи ключ на serpapi.com и добавь в .env: SERPAPI_KEY=..."
-        );
-        return;
-      }
-      clearState(userId);
-      setState(userId, { mode: "add_search", step: "query" });
+    if (text === t(lang, "btn.stats") && userId === ADMIN_ID) {
+      const usersCount = await User.countDocuments();
+      const wishesCount = await Wish.countDocuments({ status: { $ne: "archived" } });
       await ctx.reply(
-        "🔍 Что ищем? Опиши товар своими словами:\n" +
-          "Например: «беспроводные наушники», «крем для рук с лавандой»\n\n/cancel — отмена"
+        t(lang, "msg.stats", { users: usersCount, wishes: wishesCount }),
+        { parse_mode: "Markdown", reply_markup: getAdminKeyboard(lang) }
       );
       return;
     }
 
-    if (text === "🎁 Идея подарка") {
-      await ctx.reply("🤔 Думаю над идеями...");
+    if (text === t(lang, "btn.broadcast") && userId === ADMIN_ID) {
+      setState(userId, { mode: "broadcast" });
+      await ctx.reply(t(lang, "msg.broadcastPrompt"));
+      return;
+    }
+
+    if (text === t(lang, "btn.donateBroadcast") && userId === ADMIN_ID) {
+      setState(userId, { mode: "donate_broadcast" });
+      await ctx.reply(t(lang, "msg.donateAskAmount"), { parse_mode: "Markdown" });
+      return;
+    }
+
+    // ── Reply keyboard buttons ────────────────────────────────────────────
+    if (text === t(lang, "btn.addProduct")) {
+      clearState(userId);
+      setState(userId, { mode: "add_method", lang });
+      await ctx.reply(t(lang, "msg.addMethod"), { reply_markup: getAddMethodKeyboard(lang) });
+      return;
+    }
+
+    if (text === t(lang, "btn.myWishes"))      { await showOwnerWishes(ctx, lang); return; }
+    if (text === t(lang, "btn.partnerWishes")) { await showPartnerWishes(ctx, lang); return; }
+    if (text === t(lang, "btn.history"))       { await showBuyerHistory(ctx, lang); return; }
+
+    if (text === t(lang, "btn.findProduct")) {
+      if (!SEARCH_ALLOWED.has(userId)) {
+        await ctx.reply(t(lang, "msg.searchAccess"));
+        return;
+      }
+      if (!process.env.SERPAPI_KEY) {
+        await ctx.reply(t(lang, "msg.searchNoKey"));
+        return;
+      }
+      clearState(userId);
+      setState(userId, { mode: "add_search", step: "query", lang });
+      await ctx.reply(t(lang, "msg.searchQuery"));
+      return;
+    }
+
+    if (text === t(lang, "btn.giftIdea")) {
+      await ctx.reply(t(lang, "msg.thinkingIdea"));
       try {
         const idea = await gptGiftIdea(userId);
         await ctx.reply(idea, { reply_markup: await getMainKeyboard(userId) });
       } catch (e) {
         console.error("gptGiftIdea error:", e.message);
-        await ctx.reply("Не смог придумать идею, попробуй ещё раз 🙈");
+        await ctx.reply(t(lang, "msg.ideaError"));
       }
       return;
     }
 
-    if (text === "💬 Поболтать") {
+    if (text === t(lang, "btn.chat")) {
       clearState(userId);
-      setState(userId, { mode: "talk", chatHistory: [] });
-      await ctx.reply("Привет! Поговорим? 💬\nПиши что хочешь, а /cancel выйдет из режима болтовни.");
+      setState(userId, { mode: "talk", chatHistory: [], lang });
+      await ctx.reply(t(lang, "msg.chatMode"));
       return;
     }
 
-    if (text === "⚙️ Настройки") {
-      await ctx.reply("Настройки:", { reply_markup: getSettingsKeyboard() });
+    if (text === t(lang, "btn.settings")) {
+      await ctx.reply(t(lang, "msg.settings"), { reply_markup: getSettingsKeyboard(lang) });
       return;
     }
 
-    if (text === "🔗 Привязать покупателя") {
+    if (text === t(lang, "btn.langSettings")) {
+      await ctx.reply(t(lang, "msg.chooseLang"), { reply_markup: getLangKeyboard() });
+      return;
+    }
+
+    if (text === t(lang, "btn.donate")) {
+      setState(userId, { mode: "user_donate" });
+      await ctx.reply(t(lang, "msg.donateUserAsk"), { parse_mode: "Markdown" });
+      return;
+    }
+
+    if (text === t(lang, "btn.bindBuyer")) {
       setState(userId, { mode: "bind" });
-      await ctx.reply(
-        "Введи Telegram ID покупателя (только цифры).\n" +
-          "Чтобы узнать ID — пусть партнёр напишет /myid боту."
-      );
+      await ctx.reply(t(lang, "msg.enterBuyerId"));
       return;
     }
 
-    if (text === "🔓 Отвязать покупателя") {
+    if (text === t(lang, "btn.unbindBuyer")) {
       const binding = await Binding.findOne({ ownerId: userId });
       if (binding) {
         const oldBuyerId = binding.viewerId;
         await Binding.deleteOne({ ownerId: userId });
         await updateUserRole(userId);
         await updateUserRole(oldBuyerId);
-        await ctx.reply("Покупатель отвязан. 👋", { reply_markup: await getMainKeyboard(userId) });
+        await ctx.reply(t(lang, "msg.buyerUnbound"), { reply_markup: await getMainKeyboard(userId) });
       } else {
-        await ctx.reply("У тебя нет привязанного покупателя.");
+        await ctx.reply(t(lang, "msg.noBuyer"));
       }
       return;
     }
 
-    if (text === "👤 Мой ID") {
-      await ctx.reply(`Твой Telegram ID: \`${ctx.from.id}\``, { parse_mode: "Markdown" });
+    if (text === t(lang, "btn.myId")) {
+      await ctx.reply(t(lang, "msg.myId", { id: ctx.from.id }), { parse_mode: "Markdown" });
       return;
     }
 
-    if (text === "⬅️ Назад") {
+    if (text === t(lang, "btn.back")) {
       clearState(userId);
-      await ctx.reply("Главное меню:", { reply_markup: await getMainKeyboard(userId) });
+      setState(userId, { lang });
+      await ctx.reply(t(lang, "msg.menu"), { reply_markup: await getMainKeyboard(userId) });
       return;
     }
 
-    // ── State: bind ──────────────────────────────────────────────────────
+    // ── State: broadcast ──────────────────────────────────────────────────
+    if (s.mode === "broadcast" && userId === ADMIN_ID) {
+      const message = text.trim();
+      const users = await User.find({}, "userId");
+      let sent = 0;
+      for (const user of users) {
+        try {
+          await bot.api.sendMessage(user.userId, message);
+          sent++;
+        } catch { /* skip blocked/inactive users */ }
+      }
+      clearState(userId);
+      setState(userId, { lang });
+      await ctx.reply(
+        t(lang, "msg.broadcastSent", { count: sent }),
+        { reply_markup: getAdminKeyboard(lang) }
+      );
+      return;
+    }
+
+    // ── State: donate_broadcast ───────────────────────────────────────────
+    if (s.mode === "donate_broadcast" && userId === ADMIN_ID) {
+      const stars = parseInt(text.trim(), 10);
+      if (!stars || stars < 1) {
+        await ctx.reply(t(lang, "msg.donateInvalidAmount"));
+        return;
+      }
+      const users = await User.find({}, "userId lang");
+      let sent = 0;
+      for (const user of users) {
+        try {
+          const uLang = user.lang ?? "ru";
+          await bot.api.sendInvoice(
+            user.userId,
+            t(uLang, "msg.donateInvoiceTitle"),
+            t(uLang, "msg.donateInvoiceDesc"),
+            "donate",
+            "XTR",
+            [{ label: t(uLang, "msg.donateInvoiceLabel"), amount: stars }]
+          );
+          sent++;
+        } catch { /* skip blocked/inactive users */ }
+      }
+      clearState(userId);
+      setState(userId, { lang });
+      await ctx.reply(
+        t(lang, "msg.donateSent", { count: sent, stars }),
+        { reply_markup: getAdminKeyboard(lang) }
+      );
+      return;
+    }
+
+    // ── State: user_donate ────────────────────────────────────────────────
+    if (s.mode === "user_donate") {
+      const stars = parseInt(text.trim(), 10);
+      if (!stars || stars < 1) {
+        await ctx.reply(t(lang, "msg.donateUserInvalid"));
+        return;
+      }
+      clearState(userId);
+      setState(userId, { lang });
+      await bot.api.sendInvoice(
+        userId,
+        t(lang, "msg.donateInvoiceTitle"),
+        t(lang, "msg.donateInvoiceDesc"),
+        "donate",
+        "XTR",
+        [{ label: t(lang, "msg.donateInvoiceLabel"), amount: stars }]
+      );
+      return;
+    }
+
+    // ── State: bind ───────────────────────────────────────────────────────
     if (s.mode === "bind") {
       const input = text.trim();
       if (!/^\d+$/.test(input)) {
-        await ctx.reply("ID должен содержать только цифры. Попробуй ещё раз.\n(или /cancel)");
+        await ctx.reply(t(lang, "msg.idDigitsOnly"));
         return;
       }
       if (input === userId) {
-        await ctx.reply("Нельзя привязать самого себя 😄");
+        await ctx.reply(t(lang, "msg.cantBindSelf"));
         return;
       }
       await Binding.findOneAndUpdate({ ownerId: userId }, { viewerId: input }, { upsert: true });
       await updateUserRole(userId);
       await updateUserRole(input);
       clearState(userId);
+      setState(userId, { lang });
 
       await ctx.reply(
-        `Покупатель привязан! 🎉\nID: \`${input}\`\n\nТеперь он будет получать уведомления о новых хотелках.`,
+        t(lang, "msg.buyerBound", { id: input }),
         { parse_mode: "Markdown", reply_markup: await getMainKeyboard(userId) }
       );
 
       const owner = await User.findOne({ userId });
       const ownerName = owner?.firstName ?? "Партнёр";
+      const buyerLang = await fetchUserLang(input);
       try {
         await bot.api.sendMessage(
           input,
-          `💝 *${escMd(ownerName)}* привязал(а) тебя как покупателя!\n\n` +
-            `Теперь ты будешь получать уведомления о новых хотелках.\n` +
-            `Нажми /menu чтобы увидеть обновлённое меню.`,
+          t(buyerLang, "msg.boundNotification", { ownerName: escMd(ownerName) }),
           { parse_mode: "Markdown", reply_markup: await getMainKeyboard(input) }
         );
       } catch { /* buyer hasn't started bot yet */ }
       return;
     }
 
-    // ── State: add (manual flow) ─────────────────────────────────────────
+    // ── State: add (manual flow) ──────────────────────────────────────────
     if (s.mode === "add") {
       if (s.step === "photo") {
-        await ctx.reply("Сначала отправь фото 📸\n(или /cancel)");
+        await ctx.reply(t(lang, "msg.waitPhoto"));
         return;
       }
       if (s.step === "title") {
         const title = text.trim();
-        if (!title) { await ctx.reply("Название не может быть пустым. Введи ещё раз:"); return; }
+        if (!title) { await ctx.reply(t(lang, "msg.emptyTitle")); return; }
         setState(userId, { title, step: "link" });
-        await ctx.reply("Отлично! Теперь отправь ссылку на товар.\n(или напиши «нет» если ссылки нет)");
+        await ctx.reply(t(lang, "msg.enterLink"));
         return;
       }
       if (s.step === "link") {
         let link = text.trim();
-        const skip = ["нет", "no", "-"].includes(link.toLowerCase());
+        const langSkip = t(lang, "linkSkip");
+        const skip = langSkip.includes(link.toLowerCase());
         if (!skip) {
           const hasProto = /^https?:\/\//i.test(link);
           const hasDomain = /\.\w{2,}/i.test(link);
-          if (!hasProto && !hasDomain) {
-            await ctx.reply("Ссылка выглядит неправильно. Введи URL или напиши «нет»:");
-            return;
-          }
+          if (!hasProto && !hasDomain) { await ctx.reply(t(lang, "msg.invalidLink")); return; }
           if (!hasProto) link = "https://" + link;
         } else {
           link = "";
         }
         setState(userId, { link, step: "price" });
-        await ctx.reply("Сколько стоит? (1500₽, $50, ~2000, «не знаю»):");
+        await ctx.reply(t(lang, "msg.enterPrice"));
         return;
       }
       if (s.step === "price") {
-        setState(userId, { price: text.trim() || "Не указана", step: "priority" });
-        await ctx.reply("Выбери приоритет:", { reply_markup: getPriorityKeyboard() });
+        setState(userId, { price: text.trim() || t(lang, "msg.priceUnknown"), step: "priority" });
+        await ctx.reply(t(lang, "msg.choosePriority"), { reply_markup: getPriorityKeyboard(lang) });
         return;
       }
-      // confirm/other steps — ignore text, wait for callback
       return;
     }
 
@@ -1053,35 +1161,26 @@ bot.on("message:text", async (ctx) => {
       if (s.step === "url") {
         let url = text.trim();
         if (!url.startsWith("http")) url = "https://" + url;
-        await ctx.reply("⏳ Загружаю страницу и ищу товар...");
+        await ctx.reply(t(lang, "msg.loadingPage"));
         try {
           const product = await fetchProductData(url);
           if (!product || !product.title || !product.image) {
-            await ctx.reply(
-              "😔 Не удалось распознать товар по этой ссылке.\n" +
-                "Попробуй другую ссылку или добавь вручную.",
-              { reply_markup: getAddMethodKeyboard() }
-            );
+            await ctx.reply(t(lang, "msg.cantRecognize"), { reply_markup: getAddMethodKeyboard(lang) });
             clearState(userId);
-            setState(userId, { mode: "add_method" });
+            setState(userId, { mode: "add_method", lang });
             return;
           }
           setState(userId, {
-            mode: "add",
-            step: "confirm",
+            mode: "add", step: "confirm",
             title: product.title,
-            price: product.price || "Не указана",
+            price: product.price || t(lang, "msg.priceUnknown"),
             link: product.link || url,
-            photoUrl: product.image,
-            photoFileId: null,
-            priority: 2,
+            photoUrl: product.image, photoFileId: null, priority: 2,
           });
-          await sendConfirmPreview(ctx, getState(userId));
+          await sendConfirmPreview(ctx, getState(userId), lang);
         } catch (e) {
           console.error("fetchProductData error:", e.message);
-          await ctx.reply(
-            "⚠️ Не смог загрузить страницу. Проверь ссылку или добавь товар вручную.\n/cancel — отмена",
-          );
+          await ctx.reply(t(lang, "msg.loadError"));
         }
         return;
       }
@@ -1091,79 +1190,63 @@ bot.on("message:text", async (ctx) => {
     if (s.mode === "add_search") {
       if (s.step === "query") {
         const query = text.trim();
-
         const isUrl =
           /^https?:\/\//i.test(query) ||
           (/^[\w.-]+\.[a-z]{2,}(\/\S*)?$/i.test(query) && !query.includes(" "));
+
         if (isUrl) {
           let url = query;
           if (!/^https?:\/\//i.test(url)) url = "https://" + url;
-          await ctx.reply("⏳ Завантажую сторінку, шукаю товар...");
+          await ctx.reply(t(lang, "msg.loadingPage"));
           try {
             const product = await fetchProductData(url);
             if (!product || !product.title) {
-              await ctx.reply(
-                "😔 Не вдалося розпізнати товар за цим посиланням.\nСпробуй інше або добавь вручну.",
-                { reply_markup: getAddMethodKeyboard() }
-              );
+              await ctx.reply(t(lang, "msg.cantRecognize"), { reply_markup: getAddMethodKeyboard(lang) });
               clearState(userId);
-              setState(userId, { mode: "add_method" });
+              setState(userId, { mode: "add_method", lang });
               return;
             }
             setState(userId, {
-              mode: "add",
-              step: "confirm",
+              mode: "add", step: "confirm",
               title: product.title,
-              price: product.price || "Не вказана",
+              price: product.price || t(lang, "msg.priceUnknown"),
               link: product.link || url,
-              photoUrl: product.image,
-              photoFileId: null,
-              priority: 2,
+              photoUrl: product.image, photoFileId: null, priority: 2,
             });
-            await sendConfirmPreview(ctx, getState(userId));
+            await sendConfirmPreview(ctx, getState(userId), lang);
           } catch (e) {
             console.error("fetchProductData error:", e.message);
-            await ctx.reply(
-              "⚠️ Не вдалося завантажити сторінку. Перевір посилання або добавь товар вручну.\n/cancel — скасувати"
-            );
+            await ctx.reply(t(lang, "msg.loadError"));
           }
           return;
         }
 
-        await ctx.reply("🔍 Ищу товары, подожди секунду...");
+        await ctx.reply(t(lang, "msg.searching"));
         try {
           const { query: searchQ } = await gptBuildSearchQuery(query);
           const results = await searchGoogleShopping(searchQ);
 
           if (!results || results.length === 0) {
-            await ctx.reply(
-              "😔 По этому запросу ничего не нашлось. Попробуй другие слова или добавь вручную.",
-              { reply_markup: getAddMethodKeyboard() }
-            );
+            await ctx.reply(t(lang, "msg.noResults"), { reply_markup: getAddMethodKeyboard(lang) });
             clearState(userId);
-            setState(userId, { mode: "add_method" });
+            setState(userId, { mode: "add_method", lang });
             return;
           }
 
-          setState(userId, { mode: "add_search", step: "results", searchResults: results });
-          await ctx.reply(`Нашёл ${results.length} вариант(а) по запросу «${searchQ}»:`);
+          setState(userId, { mode: "add_search", step: "results", searchResults: results, lang });
+          await ctx.reply(t(lang, "msg.foundResults", { count: results.length, query: searchQ }));
 
           for (let i = 0; i < results.length; i++) {
             const item = results[i];
             const caption =
               `*${escMd(item.title || "Товар")}*\n` +
-              `💰 ${escMd(item.price || "Цена не указана")}\n` +
+              `💰 ${escMd(item.price || "—")}\n` +
               `🏪 ${escMd(item.source || "")}\n` +
               (item.link ? `🔗 [Страница товара](${item.link})` : "");
-            const kb = new InlineKeyboard().text("✅ Добавить в хотелки", `pick:${i}`);
-
+            const kb = new InlineKeyboard().text(t(lang, "ibtn.addToWishlist"), `pick:${i}`);
             if (item.thumbnail) {
               try {
-                await ctx.replyWithPhoto(item.thumbnail, {
-                  caption,
-                  parse_mode: "Markdown",
-                  reply_markup: kb,
-                });
+                await ctx.replyWithPhoto(item.thumbnail, { caption, parse_mode: "Markdown", reply_markup: kb });
                 continue;
               } catch { /* fall through */ }
             }
@@ -1172,46 +1255,48 @@ bot.on("message:text", async (ctx) => {
         } catch (e) {
           console.error("search error:", e.message);
           const msg = e.message?.includes("SERPAPI_KEY")
-            ? "⚠️ SerpAPI ключ не настроен. Добавь SERPAPI_KEY в .env"
-            : `⚠️ Ошибка поиска: ${e.message}\nПопробуй ещё раз или добавь вручную.`;
+            ? t(lang, "msg.searchNoKey")
+            : `⚠️ ${e.message}`;
           await ctx.reply(msg, { reply_markup: await getMainKeyboard(userId) });
           clearState(userId);
+          setState(userId, { lang });
         }
         return;
       }
     }
 
-    // ── State: note ──────────────────────────────────────────────────────
+    // ── State: note ───────────────────────────────────────────────────────
     if (s.mode === "note" && s.wishId) {
       const note = text.trim();
-      if (!note) { await ctx.reply("Заметка не может быть пустой. Напиши что-нибудь:"); return; }
+      if (!note) { await ctx.reply(t(lang, "msg.emptyNote")); return; }
       const wish = await Wish.findOneAndUpdate(
         { id: s.wishId },
         { noteFromBuyer: note, updatedAt: new Date() },
         { new: true }
       );
-      if (!wish) {
-        await ctx.reply("Хотелка не найдена.");
-        clearState(userId);
-        return;
-      }
+      if (!wish) { await ctx.reply(t(lang, "msg.wishNotFound")); clearState(userId); return; }
       clearState(userId);
-
-      await ctx.reply("Заметка сохранена! 📝", { reply_markup: await getMainKeyboard(userId) });
+      setState(userId, { lang });
+      await ctx.reply(t(lang, "msg.noteSaved"), { reply_markup: await getMainKeyboard(userId) });
 
       const buyer = await User.findOne({ userId });
       const buyerName = buyer?.firstName ?? "Покупатель";
+      const ownerLang = await fetchUserLang(wish.ownerId);
       try {
         await bot.api.sendMessage(
           wish.ownerId,
-          `📝 *${escMd(buyerName)}* оставил(а) заметку к хотелке *${escMd(wish.title)}*:\n_${escMd(note)}_`,
+          t(ownerLang, "msg.noteNotification", {
+            buyerName: escMd(buyerName),
+            title: escMd(wish.title),
+            note: escMd(note),
+          }),
           { parse_mode: "Markdown" }
         );
       } catch { /* owner may be unreachable */ }
       return;
     }
 
-    // ── State: talk ──────────────────────────────────────────────────────
+    // ── State: talk ───────────────────────────────────────────────────────
     if (s.mode === "talk") {
       const reply = await gptTalk(userId, text);
       await ctx.reply(reply);
@@ -1219,10 +1304,10 @@ bot.on("message:text", async (ctx) => {
     }
 
     // ── Default ───────────────────────────────────────────────────────────
-    await ctx.reply("Используй меню 👇", { reply_markup: await getMainKeyboard(userId) });
+    await ctx.reply(t(lang, "msg.useMenu"), { reply_markup: await getMainKeyboard(userId) });
   } catch (e) {
     console.error("message:text error:", e);
-    try { await ctx.reply("Что-то пошло не так. Попробуй ещё раз или /cancel"); } catch {}
+    try { await ctx.reply("Что-то пошло не так. /cancel"); } catch {}
   }
 });
 
@@ -1231,167 +1316,173 @@ bot.on("message:photo", async (ctx) => {
   try {
     await ensureUser(ctx);
     const userId = String(ctx.from.id);
+    const lang = getLang(userId);
     const s = getState(userId);
 
     if (s.mode === "add" && s.step === "photo") {
       const photos = ctx.message.photo;
       const best = photos[photos.length - 1];
       setState(userId, { photoFileId: best.file_id, photoUrl: null, step: "title" });
-      await ctx.reply("Отлично! Теперь напиши название товара:");
+      await ctx.reply(t(lang, "msg.enterTitle"));
       return;
     }
 
-    await ctx.reply("Фото получено, но сейчас я его не ожидаю.\nИспользуй меню 👇", {
-      reply_markup: await getMainKeyboard(userId),
-    });
-  } catch (e) {
-    console.error("message:photo error:", e);
-  }
+    await ctx.reply(t(lang, "msg.photoUnexpected"), { reply_markup: await getMainKeyboard(userId) });
+  } catch (e) { console.error("message:photo error:", e); }
 });
 
 // ─── Callback query handler ───────────────────────────────────────────────
 bot.on("callback_query:data", async (ctx) => {
   await ctx.answerCallbackQuery();
-
   try {
+    await ensureUser(ctx);
     const userId = String(ctx.from.id);
+    const lang = getLang(userId);
     const data = ctx.callbackQuery.data;
     const s = getState(userId);
 
-    // ── Add method selection ───────────────────────────────────────────
     if (data === "add_method:manual") {
       clearState(userId);
-      setState(userId, { mode: "add", step: "photo" });
-      await ctx.reply("Отправь фото товара 📸\n(или /cancel для отмены)");
+      setState(userId, { mode: "add", step: "photo", lang });
+      await ctx.reply(t(lang, "msg.sendPhoto"));
       return;
     }
 
     if (data === "add_method:link") {
       clearState(userId);
-      setState(userId, { mode: "add_link", step: "url" });
-      await ctx.reply(
-        "Отправь ссылку на товар 🔗\n" +
-          "Например: https://www.ozon.ru/product/...\n(или /cancel для отмены)"
-      );
+      setState(userId, { mode: "add_link", step: "url", lang });
+      await ctx.reply(t(lang, "msg.sendLink"));
       return;
     }
 
     if (data === "add_method:search") {
       if (!SEARCH_ALLOWED.has(userId)) {
-        await ctx.answerCallbackQuery("⛔ У вас нет доступа к поиску.");
+        await ctx.answerCallbackQuery(t(lang, "msg.searchAccess"));
         return;
       }
       if (!process.env.SERPAPI_KEY) {
-        await ctx.reply(
-          "⚠️ Поиск в интернете недоступен — не задан SERPAPI_KEY в .env\n\n" +
-            "Получи ключ на serpapi.com и добавь в .env:\nSERPAPI_KEY=твой_ключ"
-        );
+        await ctx.reply(t(lang, "msg.searchNoKeyInline"));
         return;
       }
       clearState(userId);
-      setState(userId, { mode: "add_search", step: "query" });
-      await ctx.reply(
-        "🔍 Что ищем? Опиши товар своими словами:\n" +
-          "Например: «беспроводные наушники для спорта», «крем для рук с лавандой»\n(или /cancel)"
-      );
+      setState(userId, { mode: "add_search", step: "query", lang });
+      await ctx.reply(t(lang, "msg.searchQuery"));
       return;
     }
 
-    // ── Priority selection ─────────────────────────────────────────────
     if (/^priority_[123]$/.test(data)) {
       if (s.mode !== "add" || s.step !== "priority") return;
       const priority = parseInt(data.split("_")[1]);
       setState(userId, { priority, step: "confirm" });
-      await sendConfirmPreview(ctx, getState(userId));
+      await sendConfirmPreview(ctx, getState(userId), lang);
       return;
     }
 
-    // ── Confirm add ───────────────────────────────────────────────────
     if (data === "confirm_add") {
-      if (s.mode !== "add") return;
-      await finalizeWish(ctx, userId, s);
+      if (s.mode !== "add") {
+        await ctx.reply(t(lang, "msg.cancelled"), { reply_markup: await getMainKeyboard(userId) });
+        return;
+      }
+      await finalizeWish(ctx, userId, s, lang);
       return;
     }
 
-    // ── Edit add (restart from title, keep photo) ─────────────────────
     if (data === "edit_add") {
       setState(userId, { mode: "add", step: "title" });
-      await ctx.reply("Хорошо, отредактируем! Введи название товара заново:");
+      await ctx.reply(t(lang, "msg.editAdd"));
       return;
     }
 
-    // ── Cancel add ─────────────────────────────────────────────────────
     if (data === "cancel_add") {
       clearState(userId);
-      await ctx.reply("Добавление отменено.", { reply_markup: await getMainKeyboard(userId) });
+      setState(userId, { lang });
+      await ctx.reply(t(lang, "msg.cancelAdd"), { reply_markup: await getMainKeyboard(userId) });
       return;
     }
 
-    // ── Search: pick result ────────────────────────────────────────────
     if (data.startsWith("pick:")) {
       const idx = parseInt(data.split(":")[1]);
       const results = s.searchResults;
-
       if (!Array.isArray(results) || idx < 0 || idx >= results.length) {
-        await ctx.reply("Не смог найти выбранный товар. Попробуй поиск ещё раз.");
+        await ctx.reply(t(lang, "msg.searchItemNotFound"));
         return;
       }
-
       const item = results[idx];
       setState(userId, {
-        mode: "add",
-        step: "confirm",
-        title: item.title || "Товар",
-        price: item.price || "Не указана",
+        mode: "add", step: "confirm",
+        title: item.title || t(lang, "msg.untitled"),
+        price: item.price || t(lang, "msg.priceUnknown"),
         link: item.link || item.product_link || "",
-        photoUrl: item.thumbnail || null,
-        photoFileId: null,
-        priority: 2,
+        photoUrl: item.thumbnail || null, photoFileId: null, priority: 2,
       });
-
-      await ctx.reply("Отлично! Вот карточка товара:");
-      await sendConfirmPreview(ctx, getState(userId));
+      await ctx.reply(t(lang, "msg.productCard"));
+      await sendConfirmPreview(ctx, getState(userId), lang);
       return;
     }
 
-    // ── Buyer: mark status ─────────────────────────────────────────────
-    if (data.startsWith("mark_bought:")) {
-      await updateWishStatus(ctx, userId, data.split(":")[1], "bought");
-      return;
-    }
-    if (data.startsWith("mark_planned:")) {
-      await updateWishStatus(ctx, userId, data.split(":")[1], "planned");
-      return;
-    }
-    if (data.startsWith("mark_archived:")) {
-      await updateWishStatus(ctx, userId, data.split(":")[1], "archived");
-      return;
-    }
+    if (data.startsWith("mark_bought:"))   { await updateWishStatus(ctx, userId, data.split(":")[1], "bought",   lang); return; }
+    if (data.startsWith("mark_planned:"))  { await updateWishStatus(ctx, userId, data.split(":")[1], "planned",  lang); return; }
+    if (data.startsWith("mark_archived:")) { await updateWishStatus(ctx, userId, data.split(":")[1], "archived", lang); return; }
 
-    // ── Buyer: note ────────────────────────────────────────────────────
     if (data.startsWith("note:")) {
       setState(userId, { mode: "note", wishId: data.split(":")[1] });
-      await ctx.reply("Напиши заметку для этой хотелки:\n(или /cancel для отмены)");
+      await ctx.reply(t(lang, "msg.writeNote"));
+      return;
+    }
+
+    if (data.startsWith("setlang:")) {
+      const newLang = data.split(":")[1];
+      if (!["ru", "uk", "en"].includes(newLang)) return;
+      setState(userId, { lang: newLang });
+      await User.updateOne({ userId }, { $set: { lang: newLang, langSet: true } });
+      try { await ctx.editMessageReplyMarkup(); } catch {}
+      await ctx.reply(t(newLang, "msg.langChanged"), { reply_markup: getSettingsKeyboard(newLang) });
       return;
     }
   } catch (e) {
-    console.error("callback_query error:", e);
-    try { await ctx.reply("Ошибка при обработке кнопки. Попробуй ещё раз или /cancel"); } catch {}
+    console.error("callback_query error:", e.message ?? e);
+    try {
+      const errLang = getLang(String(ctx.from.id));
+      await ctx.reply(t(errLang, "msg.buttonError"), { reply_markup: await getMainKeyboard(String(ctx.from.id)) });
+    } catch {}
   }
 });
 
 // ─── Global error handler ────────────────────────────────────────────────
+// ─── Telegram Stars payments ──────────────────────────────────────────────
+bot.on("pre_checkout_query", async (ctx) => {
+  await ctx.answerPreCheckoutQuery(true);
+});
+
+bot.on("message:successful_payment", async (ctx) => {
+  const lang = getLang(String(ctx.from.id));
+  const stars = ctx.message.successful_payment.total_amount;
+  await ctx.reply(t(lang, "msg.donateThankYou", { stars }));
+});
+
 bot.catch((err) => {
-  console.error("=== BOT ERROR ===");
-  console.error("Inner error:", err.error);
-  if (err.ctx?.update) {
-    console.error("Update:", JSON.stringify(err.ctx.update, null, 2));
-  }
+  console.error("=== BOT ERROR ===", err.error);
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────
 console.log("Wishlist bot starting...");
 await connectDB();
-bot.start({
-  onStart: (info) => console.log(`Bot @${info.username} is running!`),
-});
+
+async function startBot(attempt = 1) {
+  try {
+    await bot.start({
+      onStart: (info) => console.log(`Bot @${info.username} is running!`),
+      drop_pending_updates: true,
+    });
+  } catch (e) {
+    if (e.error_code === 409) {
+      const delay = Math.min(attempt * 5000, 30000);
+      console.log(`409 Conflict (attempt ${attempt}), retrying in ${delay / 1000}s...`);
+      setTimeout(() => startBot(attempt + 1), delay);
+    } else {
+      console.error("Fatal bot error:", e);
+      process.exit(1);
+    }
+  }
+}
+startBot();
