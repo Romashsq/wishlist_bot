@@ -14,6 +14,9 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 // ─── Bot ──────────────────────────────────────────────────────────────────
 const bot = new Bot(process.env.BOT_TOKEN);
 
+// ─── Доступ к поиску ──────────────────────────────────────────────────────
+const SEARCH_ALLOWED = new Set([458227557, 739105994]);
+
 // ─── JSON helpers ─────────────────────────────────────────────────────────
 function readJsonSafe(filePath, defaultValue) {
   try {
@@ -962,6 +965,10 @@ bot.on("message:text", async (ctx) => {
     if (text === "🧾 Куплено / История") { await showBuyerHistory(ctx); return; }
 
     if (text === "🔍 Найти товар") {
+      if (!SEARCH_ALLOWED.has(userId)) {
+        await ctx.reply("⛔ У вас нет доступа к поиску.");
+        return;
+      }
       if (!process.env.SERPAPI_KEY) {
         await ctx.reply(
           "⚠️ Поиск недоступен — не задан SERPAPI_KEY в .env\n" +
@@ -1346,6 +1353,10 @@ bot.on("callback_query:data", async (ctx) => {
     }
 
     if (data === "add_method:search") {
+      if (!SEARCH_ALLOWED.has(userId)) {
+        await ctx.answerCallbackQuery("⛔ У вас нет доступа к поиску.");
+        return;
+      }
       if (!process.env.SERPAPI_KEY) {
         await ctx.reply(
           "⚠️ Поиск в интернете недоступен — не задан SERPAPI_KEY в .env\n\n" +
