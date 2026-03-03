@@ -128,12 +128,14 @@ function getSecondaryKeyboard(userId) {
   return Keyboard.from(rows).resized();
 }
 
-function getSettingsKeyboard(lang, notifsEnabled = false) {
+function getSettingsKeyboard(lang, notifsEnabled = false, pledgeNotifsEnabled = true) {
   const notifsBtn = notifsEnabled ? t(lang, "btn.notifsOn") : t(lang, "btn.notifsOff");
+  const pledgeBtn = pledgeNotifsEnabled ? t(lang, "btn.pledgeNotifsOn") : t(lang, "btn.pledgeNotifsOff");
   return Keyboard.from([
     [t(lang, "btn.bindBuyer"), t(lang, "btn.unbindBuyer")],
     [t(lang, "btn.myId"), t(lang, "btn.langSettings")],
     [notifsBtn],
+    [pledgeBtn],
     [t(lang, "btn.back")],
   ]).resized();
 }
@@ -1175,7 +1177,8 @@ bot.on("message:text", async (ctx) => {
     if (text === t(lang, "btn.settings")) {
       const userDoc = await User.findOne({ userId });
       const notifsEnabled = userDoc?.receiveGiftNotifs ?? false;
-      await ctx.reply(t(lang, "msg.settings"), { reply_markup: getSettingsKeyboard(lang, notifsEnabled) });
+      const pledgeNotifsEnabled = userDoc?.receivePledgeNotifs ?? true;
+      await ctx.reply(t(lang, "msg.settings"), { reply_markup: getSettingsKeyboard(lang, notifsEnabled, pledgeNotifsEnabled) });
       return;
     }
 
@@ -1186,11 +1189,29 @@ bot.on("message:text", async (ctx) => {
       const userDoc = await User.findOne({ userId });
       const current = userDoc?.receiveGiftNotifs ?? false;
       const next = !current;
+      const pledgeNotifsEnabled = userDoc?.receivePledgeNotifs ?? true;
       await User.findOneAndUpdate({ userId }, { receiveGiftNotifs: next });
       const msgKey = next ? "msg.notifsEnabled" : "msg.notifsDisabled";
       await ctx.reply(t(lang, msgKey), {
         parse_mode: "Markdown",
-        reply_markup: getSettingsKeyboard(lang, next),
+        reply_markup: getSettingsKeyboard(lang, next, pledgeNotifsEnabled),
+      });
+      return;
+    }
+
+    if (
+      text === t(lang, "btn.pledgeNotifsOn") ||
+      text === t(lang, "btn.pledgeNotifsOff")
+    ) {
+      const userDoc = await User.findOne({ userId });
+      const current = userDoc?.receivePledgeNotifs ?? true;
+      const next = !current;
+      const notifsEnabled = userDoc?.receiveGiftNotifs ?? false;
+      await User.findOneAndUpdate({ userId }, { receivePledgeNotifs: next });
+      const msgKey = next ? "msg.pledgeNotifsEnabled" : "msg.pledgeNotifsDisabled";
+      await ctx.reply(t(lang, msgKey), {
+        parse_mode: "Markdown",
+        reply_markup: getSettingsKeyboard(lang, notifsEnabled, next),
       });
       return;
     }
@@ -1776,18 +1797,21 @@ bot.on("callback_query:data", async (ctx) => {
         }),
         { parse_mode: "Markdown" }
       );
-      // Notify wish owner
+      // Notify wish owner (if they have pledge notifications enabled)
       try {
-        const ownerLang = await fetchUserLang(wish.ownerId);
-        await bot.api.sendMessage(
-          wish.ownerId,
-          t(ownerLang, "msg.pledgeOwnerNotify", {
-            name: escMd(ctx.from.first_name || "Кто-то"),
-            title: escMd(wish.title),
-            holiday: getHolidayName(ownerLang, wish.holiday ?? "birthday"),
-          }),
-          { parse_mode: "Markdown" }
-        );
+        const ownerDoc = await User.findOne({ userId: wish.ownerId });
+        if (ownerDoc?.receivePledgeNotifs !== false) {
+          const ownerLang = ownerDoc?.lang ?? "ru";
+          await bot.api.sendMessage(
+            wish.ownerId,
+            t(ownerLang, "msg.pledgeOwnerNotify", {
+              name: escMd(ctx.from.first_name || "Кто-то"),
+              title: escMd(wish.title),
+              holiday: getHolidayName(ownerLang, wish.holiday ?? "birthday"),
+            }),
+            { parse_mode: "Markdown" }
+          );
+        }
       } catch { /* owner may be unreachable */ }
       return;
     }
@@ -1804,18 +1828,21 @@ bot.on("callback_query:data", async (ctx) => {
         t(lang, "msg.pledgeTaken", { title: escMd(wish.title) }),
         { parse_mode: "Markdown" }
       );
-      // Notify wish owner
+      // Notify wish owner (if they have pledge notifications enabled)
       try {
-        const ownerLang = await fetchUserLang(wish.ownerId);
-        await bot.api.sendMessage(
-          wish.ownerId,
-          t(ownerLang, "msg.pledgeOwnerNotify", {
-            name: escMd(ctx.from.first_name || "Кто-то"),
-            title: escMd(wish.title),
-            holiday: getHolidayName(ownerLang, wish.holiday ?? "birthday"),
-          }),
-          { parse_mode: "Markdown" }
-        );
+        const ownerDoc = await User.findOne({ userId: wish.ownerId });
+        if (ownerDoc?.receivePledgeNotifs !== false) {
+          const ownerLang = ownerDoc?.lang ?? "ru";
+          await bot.api.sendMessage(
+            wish.ownerId,
+            t(ownerLang, "msg.pledgeOwnerNotify", {
+              name: escMd(ctx.from.first_name || "Кто-то"),
+              title: escMd(wish.title),
+              holiday: getHolidayName(ownerLang, wish.holiday ?? "birthday"),
+            }),
+            { parse_mode: "Markdown" }
+          );
+        }
       } catch { /* owner may be unreachable */ }
       return;
     }

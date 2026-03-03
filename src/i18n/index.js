@@ -210,6 +210,10 @@ const translations = {
     "btn.notifsOff":          "🔕 Уведомления о покупках: ВЫКЛ",
     "msg.notifsEnabled":      "🔔 *Уведомления включены.*\nТы будешь получать сообщение, когда партнёр отметит хотелку как «планирует» или «купил».",
     "msg.notifsDisabled":     "🔕 *Уведомления выключены.*\nТеперь партнёр сможет тихо планировать и покупать подарки — полный сюрприз! 🤫",
+    "btn.pledgeNotifsOn":     "🎁 Кто хочет подарить: ВКЛ",
+    "btn.pledgeNotifsOff":    "🎁 Кто хочет подарить: ВЫКЛ",
+    "msg.pledgeNotifsEnabled":  "🎁 *Уведомления о подарках включены.*\nТы будешь видеть кто из друзей собирается подарить тебе что-то из праздничного списка.",
+    "msg.pledgeNotifsDisabled": "🎁 *Уведомления о подарках выключены.*\nДрузья будут тихо планировать подарки — сюрприз!",
 
     // ─── My Pledges sub-menu ──────────────────────────────────────────────
     "msg.pledgesMenu":        "🎁 *Собираюсь подарить*\n\nВыбери категорию:",
@@ -460,6 +464,10 @@ const translations = {
     "btn.notifsOff":          "🔕 Сповіщення про купівлі: ВИКЛ",
     "msg.notifsEnabled":      "🔔 *Сповіщення увімкнено.*\nТи отримуватимеш повідомлення, коли партнер відмічає хотілку як «планує» або «купив».",
     "msg.notifsDisabled":     "🔕 *Сповіщення вимкнено.*\nТепер партнер може тихо планувати й купувати подарунки — повний сюрприз! 🤫",
+    "btn.pledgeNotifsOn":     "🎁 Хто хоче подарувати: УВМ",
+    "btn.pledgeNotifsOff":    "🎁 Хто хоче подарувати: ВИКЛ",
+    "msg.pledgeNotifsEnabled":  "🎁 *Сповіщення про подарунки увімкнено.*\nТи будеш бачити хто з друзів збирається подарувати тобі щось зі святкового списку.",
+    "msg.pledgeNotifsDisabled": "🎁 *Сповіщення про подарунки вимкнено.*\nДрузі будуть тихо планувати подарунки — сюрприз!",
 
     // ─── My Pledges sub-menu ──────────────────────────────────────────────
     "msg.pledgesMenu":        "🎁 *Збираюсь подарувати*\n\nОбери категорію:",
@@ -709,6 +717,10 @@ const translations = {
     "btn.notifsOff":          "🔕 Gift notifications: OFF",
     "msg.notifsEnabled":      "🔔 *Notifications enabled.*\nYou'll receive a message when your partner marks a wish as planned or bought.",
     "msg.notifsDisabled":     "🔕 *Notifications disabled.*\nYour partner can now quietly plan and buy gifts — full surprise mode! 🤫",
+    "btn.pledgeNotifsOn":     "🎁 Who wants to gift: ON",
+    "btn.pledgeNotifsOff":    "🎁 Who wants to gift: OFF",
+    "msg.pledgeNotifsEnabled":  "🎁 *Gift pledge notifications enabled.*\nYou'll see when a friend plans to gift you something from your holiday list.",
+    "msg.pledgeNotifsDisabled": "🎁 *Gift pledge notifications disabled.*\nFriends will quietly plan their gifts — surprise!",
 
     // ─── My Pledges sub-menu ──────────────────────────────────────────────
     "msg.pledgesMenu":        "🎁 *Gifts I'm giving*\n\nChoose a category:",

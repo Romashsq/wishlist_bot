@@ -8,6 +8,7 @@ const userSchema = new mongoose.Schema({
   lang: { type: String, default: "ru" },
   langSet: { type: Boolean, default: false },
   receiveGiftNotifs: { type: Boolean, default: false },
+  receivePledgeNotifs: { type: Boolean, default: true },
   createdAt: { type: Date, default: Date.now },
 });
 
