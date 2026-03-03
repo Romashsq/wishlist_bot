@@ -558,10 +558,17 @@ function parseProductFromHtml(html, sourceUrl) {
   const ogPrice =
     ogMeta(html, "product:price:amount") ||
     ogMeta(html, "og:price:amount") ||
-    ogMeta(html, "product:price");
+    ogMeta(html, "product:price") ||
+    ogMeta(html, "og:price") ||
+    extractPriceFromHtml(html);
 
   if (ogTitle && ogImage) {
     return { title: ogTitle, image: ogImage, price: ogPrice, link: sourceUrl, source: "og" };
+  }
+
+  // Fallback: title only (no image found via OG) — still return if we have title
+  if (ogTitle) {
+    return { title: ogTitle, image: null, price: ogPrice, link: sourceUrl, source: "og-notitle" };
   }
 
   const title = htmlTitle(html);
@@ -571,8 +578,23 @@ function parseProductFromHtml(html, sourceUrl) {
     if (!img.startsWith("http")) {
       try { img = new URL(img, sourceUrl).href; } catch { img = null; }
     }
-    if (title && img) return { title, image: img, price: null, link: sourceUrl, source: "fallback" };
+    if (title && img) return { title, image: img, price: extractPriceFromHtml(html), link: sourceUrl, source: "fallback" };
   }
+  if (title) return { title, image: null, price: extractPriceFromHtml(html), link: sourceUrl, source: "title-only" };
+  return null;
+}
+
+function extractPriceFromHtml(html) {
+  // Try itemprop price
+  const itemPropM = html.match(/itemprop=["']price["'][^>]*content=["']([^"']+)["']/i)
+    || html.match(/content=["']([^"']+)["'][^>]*itemprop=["']price["']/i);
+  if (itemPropM) return itemPropM[1].trim();
+  // Try common price class patterns
+  const priceClassM = html.match(/class=["'][^"']*price[^"']*["'][^>]*>[\s]*([₴$€£¥\d][^<]{1,30})/i);
+  if (priceClassM) return priceClassM[1].replace(/\s+/g, " ").trim();
+  // Try data-price attribute
+  const dataPriceM = html.match(/data-price=["']([^"']{1,30})["']/i);
+  if (dataPriceM) return dataPriceM[1].trim();
   return null;
 }
 
@@ -654,8 +676,10 @@ async function gptExtractProduct(html, url) {
         role: "system",
         content:
           "Ти парсер товарних сторінок. З наданого HTML витягни інформацію про товар.\n" +
-          "Верни ТІЛЬКИ JSON (без markdown): {\"title\":\"назва\",\"price\":\"ціна з валютою\",\"image\":\"https://...\"}\n" +
-          "Якщо поле не знайдено — null.",
+          "Верни ТІЛЬКИ JSON (без markdown): {\"title\":\"назва товару\",\"price\":\"ціна з валютою або символом\",\"image\":\"https://...\"}\n" +
+          "Для ціни: шукай itemprop=price, data-price, класи що містять 'price', og:price, мета-теги. Якщо є кілька цін — бери найменшу (акційну).\n" +
+          "Для зображення: шукай og:image, перше велике зображення товару (не логотип, не іконку).\n" +
+          "Якщо поле не знайдено — null. Не вигадуй дані.",
       },
       { role: "user", content: `URL: ${url}\n\nHTML:\n${relevant}` },
     ]);
@@ -1583,16 +1607,17 @@ bot.on("message:text", async (ctx) => {
       if (s.step === "url") {
         let url = text.trim();
         if (!url.startsWith("http")) url = "https://" + url;
-        // Save URL in state for retry
         setState(userId, { ...s, savedUrl: url });
         await ctx.reply(t(lang, "msg.loadingPage"));
         try {
           const product = await fetchProductData(url);
-          if (!product || !product.title || !product.image) {
+          if (!product || !product.title) {
             await ctx.reply(t(lang, "msg.linkFailed"), {
+              parse_mode: "Markdown",
               reply_markup: new InlineKeyboard()
                 .text(t(lang, "ibtn.linkRetry"), "link_retry").row()
-                .text(t(lang, "ibtn.linkManual"), "link_manual"),
+                .text(t(lang, "ibtn.linkManual"), "link_manual").row()
+                .text(t(lang, "ibtn.linkCancel"), "link_cancel"),
             });
             return;
           }
@@ -1601,16 +1626,18 @@ bot.on("message:text", async (ctx) => {
             title: product.title,
             price: product.price || t(lang, "msg.priceUnknown"),
             link: product.link || url,
-            photoUrl: product.image, photoFileId: null, priority: 2,
+            photoUrl: product.image || null, photoFileId: null, priority: 2,
             holidayContext: s.holidayContext ?? null,
           });
           await sendConfirmPreview(ctx, getState(userId), lang);
         } catch (e) {
           console.error("fetchProductData error:", e.message);
           await ctx.reply(t(lang, "msg.linkFailed"), {
+            parse_mode: "Markdown",
             reply_markup: new InlineKeyboard()
               .text(t(lang, "ibtn.linkRetry"), "link_retry").row()
-              .text(t(lang, "ibtn.linkManual"), "link_manual"),
+              .text(t(lang, "ibtn.linkManual"), "link_manual").row()
+              .text(t(lang, "ibtn.linkCancel"), "link_cancel"),
           });
         }
         return;
@@ -1628,16 +1655,17 @@ bot.on("message:text", async (ctx) => {
         if (isUrl) {
           let url = query;
           if (!/^https?:\/\//i.test(url)) url = "https://" + url;
-          // Save URL in state for retry
           setState(userId, { ...s, savedUrl: url });
           await ctx.reply(t(lang, "msg.loadingPage"));
           try {
             const product = await fetchProductData(url);
             if (!product || !product.title) {
               await ctx.reply(t(lang, "msg.linkFailed"), {
+                parse_mode: "Markdown",
                 reply_markup: new InlineKeyboard()
                   .text(t(lang, "ibtn.linkRetry"), "link_retry").row()
-                  .text(t(lang, "ibtn.linkManual"), "link_manual"),
+                  .text(t(lang, "ibtn.linkManual"), "link_manual").row()
+                  .text(t(lang, "ibtn.linkCancel"), "link_cancel"),
               });
               return;
             }
@@ -1646,16 +1674,18 @@ bot.on("message:text", async (ctx) => {
               title: product.title,
               price: product.price || t(lang, "msg.priceUnknown"),
               link: product.link || url,
-              photoUrl: product.image, photoFileId: null, priority: 2,
+              photoUrl: product.image || null, photoFileId: null, priority: 2,
               holidayContext: s.holidayContext ?? null,
             });
             await sendConfirmPreview(ctx, getState(userId), lang);
           } catch (e) {
             console.error("fetchProductData error:", e.message);
             await ctx.reply(t(lang, "msg.linkFailed"), {
+              parse_mode: "Markdown",
               reply_markup: new InlineKeyboard()
                 .text(t(lang, "ibtn.linkRetry"), "link_retry").row()
-                .text(t(lang, "ibtn.linkManual"), "link_manual"),
+                .text(t(lang, "ibtn.linkManual"), "link_manual").row()
+                .text(t(lang, "ibtn.linkCancel"), "link_cancel"),
             });
           }
           return;
@@ -1813,44 +1843,13 @@ bot.on("callback_query:data", async (ctx) => {
     const data = ctx.callbackQuery.data;
     const s = getState(userId);
 
-    // ─── Link retry / manual fallback ─────────────────────────────────────
+    // ─── Link retry / manual fallback / cancel ────────────────────────────
     if (data === "link_retry") {
-      const savedUrl = s.savedUrl;
-      if (!savedUrl) {
-        const hCtx = s.holidayContext ?? null;
-        clearState(userId);
-        setState(userId, { mode: "add_link", step: "url", lang, holidayContext: hCtx });
-        await ctx.reply(t(lang, "msg.sendLink"));
-        return;
-      }
-      await ctx.reply(t(lang, "msg.loadingPage"));
-      try {
-        const product = await fetchProductData(savedUrl);
-        if (!product || !product.title || !product.image) {
-          await ctx.reply(t(lang, "msg.linkFailed"), {
-            reply_markup: new InlineKeyboard()
-              .text(t(lang, "ibtn.linkRetry"), "link_retry").row()
-              .text(t(lang, "ibtn.linkManual"), "link_manual"),
-          });
-          return;
-        }
-        setState(userId, {
-          mode: "add", step: "confirm",
-          title: product.title,
-          price: product.price || t(lang, "msg.priceUnknown"),
-          link: product.link || savedUrl,
-          photoUrl: product.image, photoFileId: null, priority: 2,
-          holidayContext: s.holidayContext ?? null,
-        });
-        await sendConfirmPreview(ctx, getState(userId), lang);
-      } catch (e) {
-        console.error("link_retry error:", e.message);
-        await ctx.reply(t(lang, "msg.linkFailed"), {
-          reply_markup: new InlineKeyboard()
-            .text(t(lang, "ibtn.linkRetry"), "link_retry").row()
-            .text(t(lang, "ibtn.linkManual"), "link_manual"),
-        });
-      }
+      // Ask user to enter a new link instead of silently re-fetching
+      const hCtx = s.holidayContext ?? null;
+      clearState(userId);
+      setState(userId, { mode: "add_link", step: "url", lang, holidayContext: hCtx });
+      await ctx.reply(t(lang, "msg.sendLink"));
       return;
     }
 
@@ -1859,6 +1858,12 @@ bot.on("callback_query:data", async (ctx) => {
       clearState(userId);
       setState(userId, { mode: "add", step: "photo", lang, holidayContext: hCtx });
       await ctx.reply(t(lang, "msg.sendPhoto"));
+      return;
+    }
+
+    if (data === "link_cancel") {
+      clearState(userId);
+      await ctx.reply(t(lang, "msg.cancelAdd"), { reply_markup: await getMainKeyboard(userId) });
       return;
     }
 
