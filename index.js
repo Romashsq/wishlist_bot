@@ -1583,13 +1583,17 @@ bot.on("message:text", async (ctx) => {
       if (s.step === "url") {
         let url = text.trim();
         if (!url.startsWith("http")) url = "https://" + url;
+        // Save URL in state for retry
+        setState(userId, { ...s, savedUrl: url });
         await ctx.reply(t(lang, "msg.loadingPage"));
         try {
           const product = await fetchProductData(url);
           if (!product || !product.title || !product.image) {
-            await ctx.reply(t(lang, "msg.cantRecognize"), { reply_markup: getAddMethodKeyboard(lang) });
-            clearState(userId);
-            setState(userId, { mode: "add_method", lang });
+            await ctx.reply(t(lang, "msg.linkFailed"), {
+              reply_markup: new InlineKeyboard()
+                .text(t(lang, "ibtn.linkRetry"), "link_retry").row()
+                .text(t(lang, "ibtn.linkManual"), "link_manual"),
+            });
             return;
           }
           setState(userId, {
@@ -1603,7 +1607,11 @@ bot.on("message:text", async (ctx) => {
           await sendConfirmPreview(ctx, getState(userId), lang);
         } catch (e) {
           console.error("fetchProductData error:", e.message);
-          await ctx.reply(t(lang, "msg.loadError"));
+          await ctx.reply(t(lang, "msg.linkFailed"), {
+            reply_markup: new InlineKeyboard()
+              .text(t(lang, "ibtn.linkRetry"), "link_retry").row()
+              .text(t(lang, "ibtn.linkManual"), "link_manual"),
+          });
         }
         return;
       }
@@ -1620,13 +1628,17 @@ bot.on("message:text", async (ctx) => {
         if (isUrl) {
           let url = query;
           if (!/^https?:\/\//i.test(url)) url = "https://" + url;
+          // Save URL in state for retry
+          setState(userId, { ...s, savedUrl: url });
           await ctx.reply(t(lang, "msg.loadingPage"));
           try {
             const product = await fetchProductData(url);
             if (!product || !product.title) {
-              await ctx.reply(t(lang, "msg.cantRecognize"), { reply_markup: getAddMethodKeyboard(lang) });
-              clearState(userId);
-              setState(userId, { mode: "add_method", lang });
+              await ctx.reply(t(lang, "msg.linkFailed"), {
+                reply_markup: new InlineKeyboard()
+                  .text(t(lang, "ibtn.linkRetry"), "link_retry").row()
+                  .text(t(lang, "ibtn.linkManual"), "link_manual"),
+              });
               return;
             }
             setState(userId, {
@@ -1640,7 +1652,11 @@ bot.on("message:text", async (ctx) => {
             await sendConfirmPreview(ctx, getState(userId), lang);
           } catch (e) {
             console.error("fetchProductData error:", e.message);
-            await ctx.reply(t(lang, "msg.loadError"));
+            await ctx.reply(t(lang, "msg.linkFailed"), {
+              reply_markup: new InlineKeyboard()
+                .text(t(lang, "ibtn.linkRetry"), "link_retry").row()
+                .text(t(lang, "ibtn.linkManual"), "link_manual"),
+            });
           }
           return;
         }
@@ -1774,6 +1790,15 @@ bot.on("message:photo", async (ctx) => {
       return;
     }
 
+    // Auto-start add flow if no active state (e.g. after bot restart)
+    if (!s.mode) {
+      const photos = ctx.message.photo;
+      const best = photos[photos.length - 1];
+      setState(userId, { mode: "add", step: "title", photoFileId: best.file_id, photoUrl: null, lang });
+      await ctx.reply(t(lang, "msg.photoAutoStart"));
+      return;
+    }
+
     await ctx.reply(t(lang, "msg.photoUnexpected"), { reply_markup: await getMainKeyboard(userId) });
   } catch (e) { console.error("message:photo error:", e); }
 });
@@ -1787,6 +1812,55 @@ bot.on("callback_query:data", async (ctx) => {
     const lang = getLang(userId);
     const data = ctx.callbackQuery.data;
     const s = getState(userId);
+
+    // ─── Link retry / manual fallback ─────────────────────────────────────
+    if (data === "link_retry") {
+      const savedUrl = s.savedUrl;
+      if (!savedUrl) {
+        const hCtx = s.holidayContext ?? null;
+        clearState(userId);
+        setState(userId, { mode: "add_link", step: "url", lang, holidayContext: hCtx });
+        await ctx.reply(t(lang, "msg.sendLink"));
+        return;
+      }
+      await ctx.reply(t(lang, "msg.loadingPage"));
+      try {
+        const product = await fetchProductData(savedUrl);
+        if (!product || !product.title || !product.image) {
+          await ctx.reply(t(lang, "msg.linkFailed"), {
+            reply_markup: new InlineKeyboard()
+              .text(t(lang, "ibtn.linkRetry"), "link_retry").row()
+              .text(t(lang, "ibtn.linkManual"), "link_manual"),
+          });
+          return;
+        }
+        setState(userId, {
+          mode: "add", step: "confirm",
+          title: product.title,
+          price: product.price || t(lang, "msg.priceUnknown"),
+          link: product.link || savedUrl,
+          photoUrl: product.image, photoFileId: null, priority: 2,
+          holidayContext: s.holidayContext ?? null,
+        });
+        await sendConfirmPreview(ctx, getState(userId), lang);
+      } catch (e) {
+        console.error("link_retry error:", e.message);
+        await ctx.reply(t(lang, "msg.linkFailed"), {
+          reply_markup: new InlineKeyboard()
+            .text(t(lang, "ibtn.linkRetry"), "link_retry").row()
+            .text(t(lang, "ibtn.linkManual"), "link_manual"),
+        });
+      }
+      return;
+    }
+
+    if (data === "link_manual") {
+      const hCtx = s.holidayContext ?? null;
+      clearState(userId);
+      setState(userId, { mode: "add", step: "photo", lang, holidayContext: hCtx });
+      await ctx.reply(t(lang, "msg.sendPhoto"));
+      return;
+    }
 
     // ─── Pledge handlers ───────────────────────────────────────────────────
     if (data.startsWith("pledge:")) {
