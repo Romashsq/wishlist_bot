@@ -1555,6 +1555,7 @@ bot.on("message:text", async (ctx) => {
             price: product.price || t(lang, "msg.priceUnknown"),
             link: product.link || url,
             photoUrl: product.image, photoFileId: null, priority: 2,
+            holidayContext: s.holidayContext ?? null,
           });
           await sendConfirmPreview(ctx, getState(userId), lang);
         } catch (e) {
@@ -1591,6 +1592,7 @@ bot.on("message:text", async (ctx) => {
               price: product.price || t(lang, "msg.priceUnknown"),
               link: product.link || url,
               photoUrl: product.image, photoFileId: null, priority: 2,
+              holidayContext: s.holidayContext ?? null,
             });
             await sendConfirmPreview(ctx, getState(userId), lang);
           } catch (e) {
@@ -1774,6 +1776,19 @@ bot.on("callback_query:data", async (ctx) => {
         }),
         { parse_mode: "Markdown" }
       );
+      // Notify wish owner
+      try {
+        const ownerLang = await fetchUserLang(wish.ownerId);
+        await bot.api.sendMessage(
+          wish.ownerId,
+          t(ownerLang, "msg.pledgeOwnerNotify", {
+            name: escMd(ctx.from.first_name || "Кто-то"),
+            title: escMd(wish.title),
+            holiday: getHolidayName(ownerLang, wish.holiday ?? "birthday"),
+          }),
+          { parse_mode: "Markdown" }
+        );
+      } catch { /* owner may be unreachable */ }
       return;
     }
 
@@ -1789,6 +1804,19 @@ bot.on("callback_query:data", async (ctx) => {
         t(lang, "msg.pledgeTaken", { title: escMd(wish.title) }),
         { parse_mode: "Markdown" }
       );
+      // Notify wish owner
+      try {
+        const ownerLang = await fetchUserLang(wish.ownerId);
+        await bot.api.sendMessage(
+          wish.ownerId,
+          t(ownerLang, "msg.pledgeOwnerNotify", {
+            name: escMd(ctx.from.first_name || "Кто-то"),
+            title: escMd(wish.title),
+            holiday: getHolidayName(ownerLang, wish.holiday ?? "birthday"),
+          }),
+          { parse_mode: "Markdown" }
+        );
+      } catch { /* owner may be unreachable */ }
       return;
     }
 
@@ -1817,7 +1845,7 @@ bot.on("callback_query:data", async (ctx) => {
         photoFileId: null,
         priority: wish.priority ?? 2,
         status: "new",
-        holiday: null,
+        holiday: wish.holiday ?? null,
       });
       await copy.save();
       await ctx.reply(t(lang, "msg.wishCopied"), { parse_mode: "Markdown" });
@@ -2046,6 +2074,7 @@ bot.on("callback_query:data", async (ctx) => {
         price: item.price || t(lang, "msg.priceUnknown"),
         link: item.link || item.product_link || "",
         photoUrl: item.thumbnail || null, photoFileId: null, priority: 2,
+        holidayContext: s.holidayContext ?? null,
       });
       await ctx.reply(t(lang, "msg.productCard"));
       await sendConfirmPreview(ctx, getState(userId), lang);
