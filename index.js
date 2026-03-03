@@ -1995,15 +1995,17 @@ bot.on("callback_query:data", async (ctx) => {
     }
 
     if (data === "add_method:manual") {
+      const hCtx = s.holidayContext ?? null;
       clearState(userId);
-      setState(userId, { mode: "add", step: "photo", lang });
+      setState(userId, { mode: "add", step: "photo", lang, holidayContext: hCtx });
       await ctx.reply(t(lang, "msg.sendPhoto"));
       return;
     }
 
     if (data === "add_method:link") {
+      const hCtx = s.holidayContext ?? null;
       clearState(userId);
-      setState(userId, { mode: "add_link", step: "url", lang });
+      setState(userId, { mode: "add_link", step: "url", lang, holidayContext: hCtx });
       await ctx.reply(t(lang, "msg.sendLink"));
       return;
     }
@@ -2017,8 +2019,9 @@ bot.on("callback_query:data", async (ctx) => {
         await ctx.reply(t(lang, "msg.searchNoKeyInline"));
         return;
       }
+      const hCtx = s.holidayContext ?? null;
       clearState(userId);
-      setState(userId, { mode: "add_search", step: "query", lang });
+      setState(userId, { mode: "add_search", step: "query", lang, holidayContext: hCtx });
       await ctx.reply(t(lang, "msg.searchQuery"));
       return;
     }
