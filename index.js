@@ -12,6 +12,7 @@ import User from "./src/models/User.js";
 import Wish from "./src/models/Wish.js";
 import Binding from "./src/models/Binding.js";
 import SavedButton from "./src/models/SavedButton.js";
+import Review from "./src/models/Review.js";
 import { t, detectLang } from "./src/i18n/index.js";
 
 // ─── OpenAI ───────────────────────────────────────────────────────────────
@@ -151,7 +152,7 @@ function getAdminKeyboard(lang) {
   return Keyboard.from([
     [t(lang, "btn.broadcast"), t(lang, "btn.stats")],
     [t(lang, "btn.donateBroadcast"), t(lang, "btn.savedButtons")],
-    [t(lang, "btn.reviewBroadcast")],
+    [t(lang, "btn.reviewBroadcast"), t(lang, "btn.adminReviews")],
     [t(lang, "btn.back")],
   ]).resized();
 }
@@ -1078,6 +1079,18 @@ bot.on("message:text", async (ctx) => {
       return;
     }
 
+    if (text === t(lang, "btn.adminReviews") && userId === ADMIN_ID) {
+      const count = await Review.countDocuments();
+      const kb = new InlineKeyboard()
+        .text(t(lang, "ibtn.reviewsAll"),   "admin_reviews:all").row()
+        .text(t(lang, "ibtn.reviewsLast5"), "admin_reviews:last5");
+      await ctx.reply(
+        t(lang, "msg.adminReviewsMenu", { count }),
+        { parse_mode: "Markdown", reply_markup: kb }
+      );
+      return;
+    }
+
     if (text === t(lang, "btn.broadcast") && userId === ADMIN_ID) {
       setState(userId, { mode: "broadcast", step: "text" });
       await ctx.reply(t(lang, "msg.broadcastPrompt"));
@@ -1414,6 +1427,12 @@ bot.on("message:text", async (ctx) => {
       clearState(userId);
       setState(userId, { lang });
       await ctx.reply(t(lang, "msg.reviewSent"), { reply_markup: await getMainKeyboard(userId) });
+      // Save to DB
+      await new Review({
+        userId,
+        userName: ctx.from.first_name || "Unknown",
+        text: reviewText,
+      }).save();
       try {
         await bot.api.sendMessage(
           ADMIN_ID,
@@ -2339,6 +2358,37 @@ bot.on("callback_query:data", async (ctx) => {
     if (data === "review:start") {
       setState(userId, { mode: "review" });
       await ctx.reply(t(lang, "msg.reviewPrompt"), { parse_mode: "Markdown" });
+      return;
+    }
+
+    // ── Admin: view reviews ────────────────────────────────────────────────
+    if (data.startsWith("admin_reviews:") && userId === ADMIN_ID) {
+      const mode = data.split(":")[1]; // "all" | "last5"
+      const reviews = mode === "last5"
+        ? await Review.find().sort({ createdAt: -1 }).limit(5)
+        : await Review.find().sort({ createdAt: -1 });
+
+      if (!reviews.length) {
+        await ctx.reply(t(lang, "msg.reviewsEmpty"));
+        return;
+      }
+
+      // Split into chunks to avoid Telegram message length limit
+      const CHUNK = 10;
+      for (let i = 0; i < reviews.length; i += CHUNK) {
+        const chunk = reviews.slice(i, i + CHUNK);
+        let text = i === 0 ? t(lang, "msg.reviewsHeader", { count: reviews.length }) : "";
+        for (const r of chunk) {
+          const date = new Date(r.createdAt).toLocaleDateString("ru-RU");
+          text += t(lang, "msg.reviewItem", {
+            name: escMd(r.userName),
+            id: r.userId,
+            date,
+            text: escMd(r.text),
+          }) + "\n\n";
+        }
+        await ctx.reply(text.trim(), { parse_mode: "Markdown" });
+      }
       return;
     }
 

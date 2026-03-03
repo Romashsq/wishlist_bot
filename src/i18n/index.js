@@ -140,6 +140,13 @@ const translations = {
 
     // ─── Admin ─────────────────────────────────────────────────────────────
     "msg.adminPanel":           "🔧 *Панель администратора*",
+    "btn.adminReviews":         "💬 Отзывы",
+    "msg.adminReviewsMenu":     "💬 *Отзывы пользователей*\n\nВсего отзывов: *{count}*",
+    "ibtn.reviewsAll":          "📋 Все отзывы",
+    "ibtn.reviewsLast5":        "🕐 Последние 5",
+    "msg.reviewsEmpty":         "Отзывов пока нет.",
+    "msg.reviewsHeader":        "💬 *Отзывы* ({count}):\n\n",
+    "msg.reviewItem":           "👤 *{name}* (ID: `{id}`)\n🕐 {date}\n_{text}_",
     "msg.broadcastPrompt":      "Введи сообщение для рассылки всем пользователям:\n\n/cancel — отмена",
     "msg.broadcastSent":        "✅ Рассылка отправлена {count} пользователям.",
     "msg.stats":                "👥 *Статистика*\n\nВсего пользователей: *{users}*\nАктивных хотелок: *{wishes}*",
