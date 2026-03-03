@@ -7,6 +7,7 @@ const userSchema = new mongoose.Schema({
   partnerIds: { type: [String], default: [] },
   lang: { type: String, default: "ru" },
   langSet: { type: Boolean, default: false },
+  receiveGiftNotifs: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now },
 });
 

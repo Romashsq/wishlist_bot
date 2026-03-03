@@ -23,6 +23,8 @@ const bot = new Bot(process.env.BOT_TOKEN);
 // ─── Constants ────────────────────────────────────────────────────────────
 const ADMIN_ID = "458227557";
 const SEARCH_ALLOWED = new Set(["458227557", "739105994"]);
+const HOLIDAYS = ["birthday", "march8", "newyear", "valentine"];
+let BOT_USERNAME = "";
 
 // ─── State machine ────────────────────────────────────────────────────────
 /** @type {Map<string, object>} */
@@ -109,16 +111,29 @@ async function getMainKeyboard(userId) {
     [t(lang, "btn.myWishes"), t(lang, "btn.giftIdea")],
   ];
   if (buyer) rows.push([t(lang, "btn.partnerWishes"), t(lang, "btn.history")]);
-  rows.push([t(lang, "btn.chat"), t(lang, "btn.settings"), t(lang, "btn.langSettings")]);
-  rows.push([t(lang, "btn.donate")]);
+  rows.push([t(lang, "btn.myPledges")]);
+  rows.push([t(lang, "btn.moreMenu")]);
+  return Keyboard.from(rows).resized();
+}
+
+function getSecondaryKeyboard(userId) {
+  const lang = getLang(String(userId));
+  const rows = [
+    [t(lang, "btn.holidays")],
+    [t(lang, "btn.chat"), t(lang, "btn.settings")],
+    [t(lang, "btn.langSettings"), t(lang, "btn.donate")],
+    [t(lang, "btn.mainMenu")],
+  ];
   if (String(userId) === ADMIN_ID) rows.push([t(lang, "btn.admin")]);
   return Keyboard.from(rows).resized();
 }
 
-function getSettingsKeyboard(lang) {
+function getSettingsKeyboard(lang, notifsEnabled = false) {
+  const notifsBtn = notifsEnabled ? t(lang, "btn.notifsOn") : t(lang, "btn.notifsOff");
   return Keyboard.from([
     [t(lang, "btn.bindBuyer"), t(lang, "btn.unbindBuyer")],
     [t(lang, "btn.myId"), t(lang, "btn.langSettings")],
+    [notifsBtn],
     [t(lang, "btn.back")],
   ]).resized();
 }
@@ -192,6 +207,45 @@ function getConfirmKeyboard(lang) {
     .text(t(lang, "ibtn.editAdd"), "edit_add")
     .row()
     .text(t(lang, "ibtn.cancelAdd"), "cancel_add");
+}
+
+function getHolidayName(lang, holiday) {
+  return t(lang, `holiday.name.${holiday}`);
+}
+
+function getHolidaySelectionKeyboard(lang) {
+  return new InlineKeyboard()
+    .text(t(lang, "btn.holiday.birthday"),  "hw:page:birthday").row()
+    .text(t(lang, "btn.holiday.march8"),    "hw:page:march8").row()
+    .text(t(lang, "btn.holiday.newyear"),   "hw:page:newyear").row()
+    .text(t(lang, "btn.holiday.valentine"), "hw:page:valentine");
+}
+
+function getHolidayPageKeyboard(lang, holiday) {
+  return new InlineKeyboard()
+    .text(t(lang, "ibtn.holiday.view"),  `hw:view:${holiday}`).row()
+    .text(t(lang, "ibtn.holiday.add"),   `hw:add:${holiday}`).row()
+    .text(t(lang, "ibtn.holiday.share"), `hw:share:${holiday}`).row()
+    .text(t(lang, "ibtn.holiday.back"),  "hw:menu");
+}
+
+function getAddMoreKeyboard(lang, holiday) {
+  return new InlineKeyboard()
+    .text(t(lang, "ibtn.holiday.addMore"), `hw:more:${holiday}`).row()
+    .text(t(lang, "ibtn.holiday.done"),    `hw:done:${holiday}`);
+}
+
+function getHolidayWishGuestKeyboard(wish, viewerId, lang) {
+  const kb = new InlineKeyboard();
+  if (wish.pledgedBy === viewerId) {
+    kb.text(t(lang, "ibtn.unpledge"), `unpledge:${wish.id}`).row();
+  } else if (wish.pledgedBy) {
+    kb.text(t(lang, "ibtn.pledgeTaken"), `pledge_confirm:${wish.id}`).row();
+  } else {
+    kb.text(t(lang, "ibtn.pledge"), `pledge:${wish.id}`).row();
+  }
+  kb.text(t(lang, "ibtn.hwCopy"), `hwcopy:${wish.id}`);
+  return kb;
 }
 
 function getBuyerWishKeyboard(wishId, lang) {
@@ -749,21 +803,24 @@ async function updateWishStatus(ctx, buyerId, wishId, status, lang) {
 
   const buyer = await User.findOne({ userId: buyerId });
   const buyerName = buyer?.firstName ?? "Покупатель";
-  const ownerLang = await fetchUserLang(wish.ownerId);
-  try {
-    await bot.api.sendMessage(
-      wish.ownerId,
-      t(ownerLang, "msg.buyerAction", {
-        buyerName: escMd(buyerName),
-        action: t(ownerLang, `action.${status}`),
-        title: escMd(wish.title),
-      }),
-      { parse_mode: "Markdown" }
-    );
-  } catch { /* owner may be unreachable */ }
+  const owner = await User.findOne({ userId: wish.ownerId });
+  if (owner?.receiveGiftNotifs) {
+    const ownerLang = owner.lang ?? "ru";
+    try {
+      await bot.api.sendMessage(
+        wish.ownerId,
+        t(ownerLang, "msg.buyerAction", {
+          buyerName: escMd(buyerName),
+          action: t(ownerLang, `action.${status}`),
+          title: escMd(wish.title),
+        }),
+        { parse_mode: "Markdown" }
+      );
+    } catch { /* owner may be unreachable */ }
+  }
 }
 
-async function finalizeWish(ctx, userId, s, lang) {
+async function finalizeWish(ctx, userId, s, lang, opts = {}) {
   const buyerId = await getBuyerId(userId);
   const wish = new Wish({
     id: generateId(),
@@ -777,6 +834,7 @@ async function finalizeWish(ctx, userId, s, lang) {
     priority: s.priority ?? 2,
     status: "new",
     noteFromBuyer: "",
+    holiday: s.holidayContext ?? null,
     createdAt: new Date(),
     updatedAt: new Date(),
   });
@@ -791,11 +849,13 @@ async function finalizeWish(ctx, userId, s, lang) {
   }
   clearState(userId);
 
-  let gptComment = "";
-  try { gptComment = await gptWishComment(wish.title); } catch {}
-  await ctx.reply(t(lang, "msg.wishSaved", { comment: gptComment }), {
-    reply_markup: await getMainKeyboard(userId),
-  });
+  if (!opts.skipSavedMsg) {
+    let gptComment = "";
+    try { gptComment = await gptWishComment(wish.title); } catch {}
+    await ctx.reply(t(lang, "msg.wishSaved", { comment: gptComment }), {
+      reply_markup: await getMainKeyboard(userId),
+    });
+  }
 
   if (buyerId) {
     const buyerLang = await fetchUserLang(buyerId);
@@ -847,6 +907,38 @@ bot.command("start", async (ctx) => {
     const userId = String(ctx.from.id);
     clearState(userId);
     const lang = getLang(userId);
+
+    // ─── Holiday referral deep link: ?start=hw_birthday_123456 ──────────
+    const payload = ctx.match;
+    if (payload?.startsWith("hw_")) {
+      const parts = payload.split("_");
+      const holiday = parts[1];
+      const targetId = parts[2];
+      if (HOLIDAYS.includes(holiday) && targetId) {
+        const targetUser = await User.findOne({ userId: targetId });
+        const ownerName = escMd(targetUser?.firstName || "Пользователь");
+        const holidayName = getHolidayName(lang, holiday);
+        const wishes = await Wish.find({ ownerId: targetId, holiday, status: { $ne: "archived" } });
+        const mainKb = await getMainKeyboard(userId);
+        if (!wishes.length) {
+          await ctx.reply(
+            `🎉 Список *${ownerName}* на *${holidayName}* пока пуст.`,
+            { parse_mode: "Markdown", reply_markup: mainKb }
+          );
+        } else {
+          await ctx.reply(
+            t(lang, "msg.holiday.viewTitle", { owner: ownerName, holiday: holidayName }),
+            { parse_mode: "Markdown", reply_markup: mainKb }
+          );
+          for (const w of wishes) {
+            const guestKb = getHolidayWishGuestKeyboard(w, userId, lang);
+            await sendWishCard(ctx, null, w, guestKb, lang, false);
+          }
+        }
+        return;
+      }
+    }
+
     const name = ctx.from.first_name || "друг";
     const caption = t(lang, "msg.start", { name: escMd(name) });
     const keyboard = await getMainKeyboard(userId);
@@ -1081,12 +1173,62 @@ bot.on("message:text", async (ctx) => {
     }
 
     if (text === t(lang, "btn.settings")) {
-      await ctx.reply(t(lang, "msg.settings"), { reply_markup: getSettingsKeyboard(lang) });
+      const userDoc = await User.findOne({ userId });
+      const notifsEnabled = userDoc?.receiveGiftNotifs ?? false;
+      await ctx.reply(t(lang, "msg.settings"), { reply_markup: getSettingsKeyboard(lang, notifsEnabled) });
+      return;
+    }
+
+    if (
+      text === t(lang, "btn.notifsOn") ||
+      text === t(lang, "btn.notifsOff")
+    ) {
+      const userDoc = await User.findOne({ userId });
+      const current = userDoc?.receiveGiftNotifs ?? false;
+      const next = !current;
+      await User.findOneAndUpdate({ userId }, { receiveGiftNotifs: next });
+      const msgKey = next ? "msg.notifsEnabled" : "msg.notifsDisabled";
+      await ctx.reply(t(lang, msgKey), {
+        parse_mode: "Markdown",
+        reply_markup: getSettingsKeyboard(lang, next),
+      });
       return;
     }
 
     if (text === t(lang, "btn.langSettings")) {
       await ctx.reply(t(lang, "msg.chooseLang"), { reply_markup: getLangKeyboard() });
+      return;
+    }
+
+    if (text === t(lang, "btn.moreMenu")) {
+      await ctx.reply(t(lang, "msg.secondaryMenu"), { reply_markup: getSecondaryKeyboard(userId) });
+      return;
+    }
+
+    if (text === t(lang, "btn.mainMenu")) {
+      await ctx.reply(t(lang, "msg.menu"), { reply_markup: await getMainKeyboard(userId) });
+      return;
+    }
+
+    if (text === t(lang, "btn.myPledges")) {
+      const total = await Wish.countDocuments({ pledgedBy: userId });
+      if (!total) {
+        await ctx.reply(t(lang, "msg.noPledges"), { parse_mode: "Markdown" });
+        return;
+      }
+      const kb = new InlineKeyboard()
+        .text(t(lang, "ibtn.pledges.planned"), "mygifts:planned").row()
+        .text(t(lang, "ibtn.pledges.bought"),   "mygifts:bought").row()
+        .text(t(lang, "ibtn.pledges.deferred"), "mygifts:deferred");
+      await ctx.reply(t(lang, "msg.pledgesMenu"), { parse_mode: "Markdown", reply_markup: kb });
+      return;
+    }
+
+    if (text === t(lang, "btn.holidays")) {
+      clearState(userId);
+      await ctx.reply(t(lang, "msg.holiday.select"), {
+        reply_markup: getHolidaySelectionKeyboard(lang),
+      });
       return;
     }
 
@@ -1601,6 +1743,219 @@ bot.on("callback_query:data", async (ctx) => {
     const data = ctx.callbackQuery.data;
     const s = getState(userId);
 
+    // ─── Pledge handlers ───────────────────────────────────────────────────
+    if (data.startsWith("pledge:")) {
+      const wishId = data.split(":")[1];
+      const wish = await Wish.findOne({ id: wishId });
+      if (!wish) { await ctx.reply(t(lang, "msg.wishNotFound")); return; }
+      if (wish.pledgedBy && wish.pledgedBy !== userId) {
+        await ctx.reply(
+          t(lang, "msg.pledgeAlready", { name: escMd(wish.pledgedByName || "Кто-то") }),
+          {
+            parse_mode: "Markdown",
+            reply_markup: new InlineKeyboard()
+              .text(t(lang, "ibtn.pledgeConfirm"), `pledge_confirm:${wishId}`).row()
+              .text(t(lang, "ibtn.hwCopy"), `hwcopy:${wishId}`),
+          }
+        );
+        return;
+      }
+      const ownerUser = await User.findOne({ userId: wish.ownerId });
+      await Wish.findOneAndUpdate(
+        { id: wishId },
+        { pledgedBy: userId, pledgedByName: ctx.from.first_name || "Гость" }
+      );
+      const holidayName = getHolidayName(lang, wish.holiday ?? "birthday");
+      await ctx.reply(
+        t(lang, "msg.pledgeDone", {
+          title: escMd(wish.title),
+          owner: escMd(ownerUser?.firstName || "Пользователь"),
+          holiday: holidayName,
+        }),
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+
+    if (data.startsWith("pledge_confirm:")) {
+      const wishId = data.split(":")[1];
+      const wish = await Wish.findOneAndUpdate(
+        { id: wishId },
+        { pledgedBy: userId, pledgedByName: ctx.from.first_name || "Гость" },
+        { new: true }
+      );
+      if (!wish) { await ctx.reply(t(lang, "msg.wishNotFound")); return; }
+      await ctx.reply(
+        t(lang, "msg.pledgeTaken", { title: escMd(wish.title) }),
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+
+    if (data.startsWith("unpledge:")) {
+      const wishId = data.split(":")[1];
+      await Wish.findOneAndUpdate(
+        { id: wishId, pledgedBy: userId },
+        { pledgedBy: null, pledgedByName: null }
+      );
+      await ctx.reply(t(lang, "msg.pledgeCancelled"), { parse_mode: "Markdown" });
+      return;
+    }
+
+    if (data.startsWith("hwcopy:")) {
+      const wishId = data.split(":")[1];
+      const wish = await Wish.findOne({ id: wishId });
+      if (!wish) { await ctx.reply(t(lang, "msg.wishNotFound")); return; }
+      const copy = new Wish({
+        id: generateId(),
+        ownerId: userId,
+        buyerId: await getBuyerId(userId),
+        title: wish.title,
+        link: wish.link,
+        price: wish.price,
+        photoUrl: wish.photoUrl,
+        photoFileId: null,
+        priority: wish.priority ?? 2,
+        status: "new",
+        holiday: null,
+      });
+      await copy.save();
+      await ctx.reply(t(lang, "msg.wishCopied"), { parse_mode: "Markdown" });
+      return;
+    }
+
+    // ─── My Gifts category navigation ─────────────────────────────────────
+    if (data.startsWith("mygifts:")) {
+      const category = data.split(":")[1]; // "planned" | "bought" | "deferred"
+      const wishes = await Wish.find({ pledgedBy: userId, pledgeStatus: category });
+      if (!wishes.length) {
+        await ctx.reply(t(lang, "msg.pledges.empty"));
+        return;
+      }
+      const ownerIds = [...new Set(wishes.map((w) => w.ownerId))];
+      const owners = await User.find({ userId: { $in: ownerIds } });
+      const ownerMap = Object.fromEntries(owners.map((u) => [u.userId, u.firstName]));
+      const headerKey = `msg.pledges.${category}`;
+      await ctx.reply(t(lang, headerKey, { count: wishes.length }), { parse_mode: "Markdown" });
+      for (const w of wishes) {
+        const ownerName = escMd(ownerMap[w.ownerId] || "—");
+        const holidayName = w.holiday ? getHolidayName(lang, w.holiday) : "—";
+        const caption = `🎁 *${escMd(w.title)}*\n👤 Для: *${ownerName}*\n🎉 Повод: ${holidayName}`;
+        const kb = new InlineKeyboard()
+          .text(t(lang, "ibtn.pledges.moveTo"), `mygift_move:${w.id}`).row()
+          .text(t(lang, "ibtn.unpledge"), `unpledge:${w.id}`);
+        if (w.photoFileId || w.photoUrl) {
+          await ctx.replyWithPhoto(w.photoFileId || w.photoUrl, {
+            caption, parse_mode: "Markdown", reply_markup: kb,
+          });
+        } else {
+          await ctx.reply(caption, { parse_mode: "Markdown", reply_markup: kb });
+        }
+      }
+      return;
+    }
+
+    // ─── Show move options for a pledged wish ──────────────────────────────
+    if (data.startsWith("mygift_move:")) {
+      const wishId = data.split(":")[1];
+      const wish = await Wish.findOne({ id: wishId, pledgedBy: userId });
+      if (!wish) { await ctx.reply(t(lang, "msg.wishNotFound")); return; }
+      const kb = new InlineKeyboard();
+      if (wish.pledgeStatus !== "planned")  kb.text(t(lang, "ibtn.pledges.toPlanned"),  `mygift_set:${wishId}:planned`).row();
+      if (wish.pledgeStatus !== "bought")   kb.text(t(lang, "ibtn.pledges.toBought"),   `mygift_set:${wishId}:bought`).row();
+      if (wish.pledgeStatus !== "deferred") kb.text(t(lang, "ibtn.pledges.toDeferred"), `mygift_set:${wishId}:deferred`);
+      await ctx.reply(`📦 *${escMd(wish.title)}*`, { parse_mode: "Markdown", reply_markup: kb });
+      return;
+    }
+
+    // ─── Move pledged wish to a category ──────────────────────────────────
+    if (data.startsWith("mygift_set:")) {
+      const parts = data.split(":");
+      const wishId = parts[1];
+      const newStatus = parts[2]; // "planned" | "bought" | "deferred"
+      await Wish.findOneAndUpdate({ id: wishId, pledgedBy: userId }, { pledgeStatus: newStatus });
+      await ctx.reply(t(lang, "msg.pledges.moved"));
+      return;
+    }
+
+    // ─── Holiday wishlist handlers ─────────────────────────────────────────
+    if (data.startsWith("hw:")) {
+      const [, action, holiday] = data.split(":");
+
+      if (action === "menu") {
+        await ctx.editMessageText(t(lang, "msg.holiday.select"), {
+          parse_mode: "Markdown",
+          reply_markup: getHolidaySelectionKeyboard(lang),
+        });
+        return;
+      }
+
+      if (action === "page") {
+        await ctx.editMessageText(
+          t(lang, "msg.holiday.page", { name: getHolidayName(lang, holiday) }),
+          { parse_mode: "Markdown", reply_markup: getHolidayPageKeyboard(lang, holiday) }
+        );
+        return;
+      }
+
+      if (action === "view") {
+        const wishes = await Wish.find({ ownerId: userId, holiday, status: { $ne: "archived" } });
+        if (!wishes.length) {
+          await ctx.reply(t(lang, "msg.holiday.noWishes"), {
+            reply_markup: getHolidayPageKeyboard(lang, holiday),
+          });
+          return;
+        }
+        let text = t(lang, "msg.holiday.header", { name: getHolidayName(lang, holiday) });
+        for (const w of wishes) {
+          text += `• *${escMd(w.title)}*`;
+          if (w.price) text += ` — ${escMd(w.price)}`;
+          text += "\n";
+        }
+        await ctx.reply(text, {
+          parse_mode: "Markdown",
+          reply_markup: getHolidayPageKeyboard(lang, holiday),
+        });
+        return;
+      }
+
+      if (action === "add" || action === "more") {
+        clearState(userId);
+        setState(userId, { mode: "add", step: "photo", holidayContext: holiday, lang });
+        await ctx.reply(t(lang, "msg.addMethod"), { reply_markup: getAddMethodKeyboard(lang) });
+        return;
+      }
+
+      if (action === "share" || action === "done") {
+        await ctx.reply(t(lang, "msg.holiday.generating"));
+        const wishes = await Wish.find({ ownerId: userId, holiday, status: { $ne: "archived" } });
+        const name = getHolidayName(lang, holiday);
+        const refLink = `https://t.me/${BOT_USERNAME}?start=hw_${holiday}_${userId}`;
+        let aiMsg = "";
+        try {
+          const wishList = wishes.map((w) => w.title).join(", ");
+          const langPrompts = { ru: "русском", uk: "украинском", en: "English" };
+          const res = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [{
+              role: "user",
+              content: `Напиши тёплое праздничное сообщение (2-3 предложения) на ${langPrompts[lang] ?? "русском"} языке. Повод: "${name}". Пользователь делится вишлистом с друзьями. Желания: ${wishList || "список пуст"}. Призови друзей помочь исполнить мечты.`,
+            }],
+            max_tokens: 200,
+          });
+          aiMsg = res.choices[0].message.content.trim();
+        } catch {
+          aiMsg = `🎉 Мой список желаний на ${name}!`;
+        }
+        await ctx.reply(`${aiMsg}\n\n${t(lang, "msg.holiday.copyLink")}`, {
+          reply_markup: new InlineKeyboard().copyText("📋 Скопировать ссылку", refLink),
+        });
+        return;
+      }
+
+      return;
+    }
+
     if (data === "do_bind") {
       clearState(userId);
       setState(userId, { mode: "bind", lang });
@@ -1650,7 +2005,14 @@ bot.on("callback_query:data", async (ctx) => {
         await ctx.reply(t(lang, "msg.cancelled"), { reply_markup: await getMainKeyboard(userId) });
         return;
       }
-      await finalizeWish(ctx, userId, s, lang);
+      const hCtx = s.holidayContext;
+      await finalizeWish(ctx, userId, s, lang, { skipSavedMsg: !!hCtx });
+      if (hCtx) {
+        setState(userId, { holidayContext: hCtx, lang });
+        await ctx.reply(t(lang, "msg.holiday.addedAsk"), {
+          reply_markup: getAddMoreKeyboard(lang, hCtx),
+        });
+      }
       return;
     }
 
@@ -2032,7 +2394,7 @@ await connectDB();
 async function startBot(attempt = 1) {
   try {
     await bot.start({
-      onStart: (info) => console.log(`Bot @${info.username} is running!`),
+      onStart: (info) => { BOT_USERNAME = info.username; console.log(`Bot @${info.username} is running!`); },
       drop_pending_updates: true,
     });
   } catch (e) {

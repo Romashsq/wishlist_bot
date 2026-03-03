@@ -18,6 +18,10 @@ const wishSchema = new mongoose.Schema({
   priority: { type: Number, default: 0 },
   status: { type: String, default: "new" },
   noteFromBuyer: { type: String, default: "" },
+  holiday:       { type: String, default: null },
+  pledgedBy:     { type: String, default: null },
+  pledgedByName: { type: String, default: null },
+  pledgeStatus:  { type: String, default: "planned" },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now },
 });
