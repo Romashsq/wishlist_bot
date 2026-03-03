@@ -110,7 +110,7 @@ async function getMainKeyboard(userId) {
   ];
   if (buyer) rows.push([t(lang, "btn.partnerWishes"), t(lang, "btn.history")]);
   rows.push([t(lang, "btn.chat"), t(lang, "btn.settings"), t(lang, "btn.langSettings")]);
-  rows.push([t(lang, "btn.donate")]);
+  rows.push([t(lang, "btn.donate"), t(lang, "btn.review")]);
   if (String(userId) === ADMIN_ID) rows.push([t(lang, "btn.admin")]);
   return Keyboard.from(rows).resized();
 }
@@ -1071,6 +1071,12 @@ bot.on("message:text", async (ctx) => {
       return;
     }
 
+    if (text === t(lang, "btn.review")) {
+      setState(userId, { mode: "review" });
+      await ctx.reply(t(lang, "msg.reviewPrompt"), { parse_mode: "Markdown" });
+      return;
+    }
+
     if (text === t(lang, "btn.bindBuyer")) {
       setState(userId, { mode: "bind" });
       await ctx.reply(t(lang, "msg.enterBuyerId"));
@@ -1213,6 +1219,27 @@ bot.on("message:text", async (ctx) => {
       return;
     }
 
+    // ── State: review ─────────────────────────────────────────────────────
+    if (s.mode === "review") {
+      const reviewText = text.trim();
+      if (!reviewText) { await ctx.reply(t(lang, "msg.reviewPrompt"), { parse_mode: "Markdown" }); return; }
+      clearState(userId);
+      setState(userId, { lang });
+      await ctx.reply(t(lang, "msg.reviewSent"), { reply_markup: await getMainKeyboard(userId) });
+      try {
+        await bot.api.sendMessage(
+          ADMIN_ID,
+          t("ru", "msg.reviewReceived", {
+            name: escMd(ctx.from.first_name || "Unknown"),
+            id: ctx.from.id,
+            text: escMd(reviewText),
+          }),
+          { parse_mode: "Markdown" }
+        );
+      } catch (e) { console.error("review notify admin error:", e.message); }
+      return;
+    }
+
     // ── State: donate_broadcast ───────────────────────────────────────────
     if (s.mode === "donate_broadcast" && userId === ADMIN_ID) {
       const stars = parseInt(text.trim(), 10);
@@ -1282,18 +1309,22 @@ bot.on("message:text", async (ctx) => {
       clearState(userId);
       setState(userId, { lang });
 
+      const owner = await User.findOne({ userId });
+      const ownerName = owner?.firstName ?? "Партнёр";
+
       await ctx.reply(
         t(lang, "msg.buyerBound", { id: input }),
         { parse_mode: "Markdown", reply_markup: await getMainKeyboard(userId) }
       );
+      // Connection tips for the owner
+      await ctx.reply(t(lang, "msg.connectionTips"), { parse_mode: "Markdown" });
 
-      const owner = await User.findOne({ userId });
-      const ownerName = owner?.firstName ?? "Партнёр";
       const buyerLang = await fetchUserLang(input);
       try {
+        // Enhanced welcome for the buyer with instructions
         await bot.api.sendMessage(
           input,
-          t(buyerLang, "msg.boundNotification", { ownerName: escMd(ownerName) }),
+          t(buyerLang, "msg.buyerConnected", { ownerName: escMd(ownerName) }),
           { parse_mode: "Markdown", reply_markup: await getMainKeyboard(input) }
         );
       } catch { /* buyer hasn't started bot yet */ }
