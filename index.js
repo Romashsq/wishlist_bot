@@ -54,8 +54,9 @@ async function fetchUserLang(userId) {
 async function ensureUser(ctx) {
   const userId = String(ctx.from.id);
   // If lang already loaded this session — skip DB call
+  const username = ctx.from.username ?? null;
   if (getState(userId).lang) {
-    User.updateOne({ userId }, { $set: { firstName: ctx.from.first_name || "Unknown" } }).catch(() => {});
+    User.updateOne({ userId }, { $set: { firstName: ctx.from.first_name || "Unknown", username } }).catch(() => {});
     return;
   }
   const firstName = ctx.from.first_name || "Unknown";
@@ -63,7 +64,7 @@ async function ensureUser(ctx) {
   const doc = await User.findOneAndUpdate(
     { userId },
     {
-      $set: { firstName },
+      $set: { firstName, username },
       $setOnInsert: {
         lang: autoLang,  // auto-detect only for brand-new users
         langSet: false,
@@ -123,6 +124,7 @@ function getSecondaryKeyboard(userId) {
     [t(lang, "btn.holidays")],
     [t(lang, "btn.chat"), t(lang, "btn.settings")],
     [t(lang, "btn.langSettings"), t(lang, "btn.donate")],
+    [t(lang, "btn.review")],
     [t(lang, "btn.mainMenu")],
   ];
   if (String(userId) === ADMIN_ID) rows.push([t(lang, "btn.admin")]);
@@ -1431,6 +1433,7 @@ bot.on("message:text", async (ctx) => {
       await new Review({
         userId,
         userName: ctx.from.first_name || "Unknown",
+        userHandle: ctx.from.username ?? null,
         text: reviewText,
       }).save();
       try {
