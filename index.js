@@ -11,6 +11,7 @@ import { connectDB } from "./src/db/connection.js";
 import User from "./src/models/User.js";
 import Wish from "./src/models/Wish.js";
 import Binding from "./src/models/Binding.js";
+import SavedButton from "./src/models/SavedButton.js";
 import { t, detectLang } from "./src/i18n/index.js";
 
 // ─── OpenAI ───────────────────────────────────────────────────────────────
@@ -61,7 +62,7 @@ async function ensureUser(ctx) {
     {
       $set: { firstName },
       $setOnInsert: {
-        lang: autoLang,
+        lang: autoLang,  // auto-detect only for brand-new users
         langSet: false,
         role: "owner",
         partnerIds: [],
@@ -70,11 +71,8 @@ async function ensureUser(ctx) {
     },
     { upsert: true, new: true }
   );
-  // If user manually chose a language — respect it; otherwise use Telegram auto-detect
-  const lang = doc.langSet ? (doc.lang ?? autoLang) : autoLang;
-  if (!doc.langSet && doc.lang !== autoLang) {
-    User.updateOne({ userId }, { $set: { lang: autoLang } }).catch(() => {});
-  }
+  // Use saved lang for existing users; auto-detect only for new users (via $setOnInsert)
+  const lang = doc.lang ?? autoLang;
   setState(userId, { lang });
 }
 
@@ -135,9 +133,40 @@ function getLangKeyboard() {
 function getAdminKeyboard(lang) {
   return Keyboard.from([
     [t(lang, "btn.broadcast"), t(lang, "btn.stats")],
-    [t(lang, "btn.donateBroadcast")],
+    [t(lang, "btn.donateBroadcast"), t(lang, "btn.savedButtons")],
     [t(lang, "btn.back")],
   ]).resized();
+}
+
+// Build inline keyboard from SavedButton array
+function buildSavedButtonsInline(buttons) {
+  const kb = new InlineKeyboard();
+  for (const btn of buttons) {
+    kb.url(btn.label, btn.url).row();
+  }
+  return kb;
+}
+
+// AI button generation
+async function generateButtonViaAI(description) {
+  const resp = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [
+      {
+        role: "system",
+        content: "You are a Telegram bot button designer. The user describes a button they want. Return ONLY a valid JSON object with exactly two fields: \"label\" (button text with a relevant emoji, max 30 chars) and \"url\" (full https URL). No markdown, no explanation — just raw JSON.",
+      },
+      { role: "user", content: description },
+    ],
+    temperature: 0.4,
+    max_tokens: 100,
+  });
+  const raw = resp.choices[0].message.content.trim();
+  const match = raw.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error("No JSON in response");
+  const parsed = JSON.parse(match[0]);
+  if (!parsed.label || !parsed.url || !parsed.url.startsWith("http")) throw new Error("Invalid fields");
+  return parsed;
 }
 
 function getAddMethodKeyboard(lang) {
@@ -322,24 +351,67 @@ STYLE RULES:
   return reply;
 }
 
-async function gptGiftIdea(userId) {
+const GIFT_SYSTEM_PROMPT = `You are a thoughtful gift advisor inside a couple's wishlist Telegram bot.
+
+ABSOLUTE RULES — never break these:
+- NEVER recommend any Russian websites, .ru domains, or Russian brands/services
+- NEVER mention: Ozon, Wildberries, Яндекс Маркет, AliExpress, Авито, CDEK, Сбербанк, ВКонтакте, or ANY Russian company
+- Ukrainian stores ARE allowed: Rozetka, Prom.ua, Allo, Makeup.com.ua, Kasta, Intertop
+- PREFERRED sources — official verified international: amazon.com, amazon.co.uk, official brand sites (apple.com, nike.com, sephora.com, etc.), ASOS, Zalando, H&M, Zara, IKEA, Sephora, Etsy
+
+HOW TO SUGGEST:
+- Suggest ONE specific product per message — never a list of multiple at once
+- Each suggestion MUST include:
+  🎁 [Exact product name]
+  💰 ~$XX or ~€XX or ~₴XXXX
+  🔗 [direct URL to buy — must be a real, working link]
+  [1-2 sentences: why this is a great gift]
+- After each suggestion ask one brief question: "Does this work, or shall I try a different direction?"
+- Adapt based on feedback: cheaper/pricier/different style/different category/different store
+
+LANGUAGE: Always respond in the SAME language the user is writing in.
+Keep each response under 200 words.`;
+
+async function startGiftChat(userId) {
   const ownerId = (await getOwnerId(userId)) || userId;
   const wishes = await Wish.find({ ownerId, status: { $ne: "archived" } });
-  const wishList = wishes.map((w) => `«${w.title}» (${w.price})`).join(", ");
+  const wishList = wishes.map((w) => `"${w.title}" (${w.price})`).join(", ");
+  const userMsg = wishList
+    ? `Based on this wishlist: ${wishList}\n\nSuggest ONE specific gift idea that fits this person's taste. Must include product name, price estimate, and a direct purchase link from a verified international source.`
+    : `Suggest ONE specific universal gift idea. Must include product name, price estimate, and a direct purchase link from a verified international source.`;
 
-  return gptRequest([
+  const messages = [
+    { role: "system", content: GIFT_SYSTEM_PROMPT },
+    { role: "user", content: userMsg },
+  ];
+  const reply = await gptRequest(messages);
+  return { reply, history: [...messages, { role: "assistant", content: reply }] };
+}
+
+async function continueGiftChat(history, userMessage) {
+  const messages = [
+    { role: "system", content: GIFT_SYSTEM_PROMPT },
+    ...history,
+    { role: "user", content: userMessage },
+  ];
+  const reply = await gptRequest(messages);
+  const newHistory = [...history, { role: "user", content: userMessage }, { role: "assistant", content: reply }];
+  if (newHistory.length > 16) newHistory.splice(0, 2);
+  return { reply, history: newHistory };
+}
+
+async function extractGiftProduct(aiMessage) {
+  const raw = await gptRequest([
     {
       role: "system",
-      content:
-        `Ти експерт з подарунків для українського ринку. Пропонуй конкретні ідеї — з назвами товарів, де купити (Rozetka, Prom.ua, Allo, Makeup, Epicentr тощо) і орієнтовними цінами в гривнях (₴). Відповідай українською або російською, коротко і по суті.`,
+      content: 'Extract the gift suggestion from this message. Return ONLY valid JSON (no markdown): {"title":"product name","url":"https://...","price":"~$XX"}. If no clear URL, use empty string for url.',
     },
-    {
-      role: "user",
-      content: wishList
-        ? `У вишліст вже є: ${wishList}.\n\nЗапропонуй 3 ідеї подарунків у схожому стилі або як доповнення. Для кожної — конкретна назва + де купити + орієнтовна ціна в ₴.`
-        : `Запропонуй 5 універсальних ідей для подарунка. Для кожної — конкретна назва товару + де купити в Україні + орієнтовна ціна в ₴.`,
-    },
+    { role: "user", content: aiMessage },
   ]);
+  try {
+    const match = raw.match(/\{[\s\S]*?\}/);
+    return match ? JSON.parse(match[0]) : null;
+  } catch { return null; }
 }
 
 async function gptBuildSearchQuery(userInput) {
@@ -808,7 +880,12 @@ bot.command("myid", async (ctx) => {
   try {
     await ensureUser(ctx);
     const lang = getLang(String(ctx.from.id));
-    await ctx.reply(t(lang, "msg.myId", { id: ctx.from.id }), { parse_mode: "Markdown" });
+    await ctx.reply(t(lang, "msg.myId", { id: ctx.from.id }), {
+      parse_mode: "Markdown",
+      reply_markup: new InlineKeyboard()
+        .copyText(t(lang, "ibtn.copyId"), String(ctx.from.id)).row()
+        .text(t(lang, "ibtn.bindBuyer"), "do_bind"),
+    });
   } catch (e) { console.error("/myid error:", e); }
 });
 
@@ -907,7 +984,7 @@ bot.on("message:text", async (ctx) => {
     }
 
     if (text === t(lang, "btn.broadcast") && userId === ADMIN_ID) {
-      setState(userId, { mode: "broadcast" });
+      setState(userId, { mode: "broadcast", step: "text" });
       await ctx.reply(t(lang, "msg.broadcastPrompt"));
       return;
     }
@@ -915,6 +992,21 @@ bot.on("message:text", async (ctx) => {
     if (text === t(lang, "btn.donateBroadcast") && userId === ADMIN_ID) {
       setState(userId, { mode: "donate_broadcast" });
       await ctx.reply(t(lang, "msg.donateAskAmount"), { parse_mode: "Markdown" });
+      return;
+    }
+
+    if (text === t(lang, "btn.savedButtons") && userId === ADMIN_ID) {
+      const buttons = await SavedButton.find().sort({ createdAt: -1 });
+      const kb = new InlineKeyboard();
+      for (const btn of buttons) {
+        kb.text(`${btn.label}`, `sbtn:view:${btn.id}`).row();
+      }
+      kb.text(t(lang, "ibtn.savedBtns.addManual"), "sbtn:add_manual").row()
+        .text(t(lang, "ibtn.savedBtns.genAI"), "sbtn:gen_ai");
+      const msg = buttons.length
+        ? t(lang, "msg.savedBtns.list", { count: buttons.length })
+        : t(lang, "msg.savedBtns.empty");
+      await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: kb });
       return;
     }
 
@@ -946,14 +1038,13 @@ bot.on("message:text", async (ctx) => {
     }
 
     if (text === t(lang, "btn.giftIdea")) {
-      await ctx.reply(t(lang, "msg.thinkingIdea"));
-      try {
-        const idea = await gptGiftIdea(userId);
-        await ctx.reply(idea, { reply_markup: await getMainKeyboard(userId) });
-      } catch (e) {
-        console.error("gptGiftIdea error:", e.message);
-        await ctx.reply(t(lang, "msg.ideaError"));
-      }
+      clearState(userId);
+      setState(userId, { mode: "gift_chat", giftHistory: [], lang });
+      await ctx.reply(t(lang, "msg.giftChatStart"), {
+        parse_mode: "Markdown",
+        reply_markup: new InlineKeyboard()
+          .text(t(lang, "ibtn.gift.auto"), "gift:auto"),
+      });
       return;
     }
 
@@ -1001,7 +1092,12 @@ bot.on("message:text", async (ctx) => {
     }
 
     if (text === t(lang, "btn.myId")) {
-      await ctx.reply(t(lang, "msg.myId", { id: ctx.from.id }), { parse_mode: "Markdown" });
+      await ctx.reply(t(lang, "msg.myId", { id: ctx.from.id }), {
+        parse_mode: "Markdown",
+        reply_markup: new InlineKeyboard()
+          .copyText(t(lang, "ibtn.copyId"), String(ctx.from.id)).row()
+          .text(t(lang, "ibtn.bindBuyer"), "do_bind"),
+      });
       return;
     }
 
@@ -1014,21 +1110,106 @@ bot.on("message:text", async (ctx) => {
 
     // ── State: broadcast ──────────────────────────────────────────────────
     if (s.mode === "broadcast" && userId === ADMIN_ID) {
-      const message = text.trim();
-      const users = await User.find({}, "userId");
-      let sent = 0;
-      for (const user of users) {
-        try {
-          await bot.api.sendMessage(user.userId, message);
-          sent++;
-        } catch { /* skip blocked/inactive users */ }
+      if (s.step === "text") {
+        setState(userId, { broadcastText: text.trim(), step: "after_text" });
+        const savedCount = await SavedButton.countDocuments();
+        const kb = new InlineKeyboard()
+          .text(t(lang, "ibtn.bcast.addBtns"), "bcast:add_btns").row()
+          .text(t(lang, "ibtn.bcast.genAI"), "bcast:gen_ai");
+        if (savedCount > 0) kb.row().text(t(lang, "ibtn.bcast.fromSaved"), "bcast:from_saved");
+        kb.row().text(t(lang, "ibtn.bcast.sendNow"), "bcast:send_now");
+        await ctx.reply(t(lang, "msg.broadcastTextSaved"), { reply_markup: kb });
+        return;
       }
-      clearState(userId);
-      setState(userId, { lang });
+
+      if (s.step === "gen_btn") {
+        await ctx.reply(t(lang, "msg.savedBtns.genThink"));
+        try {
+          const generated = await generateButtonViaAI(text.trim());
+          const bcastBtns = [...(s.broadcastButtons ?? []), { text: generated.label, url: generated.url }];
+          setState(userId, { broadcastButtons: bcastBtns, step: "confirm" });
+          const previewKb = new InlineKeyboard();
+          bcastBtns.forEach(b => { previewKb.url(b.text, b.url); previewKb.row(); });
+          await ctx.reply(t(lang, "msg.broadcastPreview"), { parse_mode: "Markdown" });
+          await ctx.reply(s.broadcastText, { reply_markup: previewKb });
+          await ctx.reply(t(lang, "msg.broadcastConfirm"), {
+            reply_markup: new InlineKeyboard()
+              .text(t(lang, "ibtn.bcast.confirm"), "bcast:confirm").row()
+              .text(t(lang, "ibtn.bcast.editBtns"), "bcast:edit_btns")
+              .text(t(lang, "ibtn.bcast.cancel"), "bcast:cancel"),
+          });
+        } catch {
+          await ctx.reply(t(lang, "msg.savedBtns.genError"));
+        }
+        return;
+      }
+      if (s.step === "buttons") {
+        const lines = text.trim().split("\n").filter(l => l.includes("|"));
+        const buttons = lines
+          .map(line => {
+            const sep = line.indexOf("|");
+            return { text: line.slice(0, sep).trim(), url: line.slice(sep + 1).trim() };
+          })
+          .filter(b => b.text && b.url.startsWith("http"));
+        if (!buttons.length) {
+          await ctx.reply(t(lang, "msg.broadcastBadBtns"), { parse_mode: "Markdown" });
+          return;
+        }
+        setState(userId, { broadcastButtons: buttons, step: "confirm" });
+        const previewKb = new InlineKeyboard();
+        buttons.forEach(b => { previewKb.url(b.text, b.url); previewKb.row(); });
+        await ctx.reply(t(lang, "msg.broadcastPreview"), { parse_mode: "Markdown" });
+        await ctx.reply(s.broadcastText, { reply_markup: previewKb });
+        await ctx.reply(t(lang, "msg.broadcastConfirm"), {
+          reply_markup: new InlineKeyboard()
+            .text(t(lang, "ibtn.bcast.confirm"), "bcast:confirm").row()
+            .text(t(lang, "ibtn.bcast.editBtns"), "bcast:edit_btns")
+            .text(t(lang, "ibtn.bcast.cancel"), "bcast:cancel"),
+        });
+        return;
+      }
+      return;
+    }
+
+    // ── State: btn_add (manual saved button creation) ─────────────────────
+    if (s.mode === "btn_add" && userId === ADMIN_ID) {
+      const input = text.trim();
+      const sep = input.indexOf("|");
+      if (sep === -1) { await ctx.reply(t(lang, "msg.savedBtns.badFormat"), { parse_mode: "Markdown" }); return; }
+      const label = input.slice(0, sep).trim();
+      const url = input.slice(sep + 1).trim();
+      if (!label || !url.startsWith("http")) { await ctx.reply(t(lang, "msg.savedBtns.badFormat"), { parse_mode: "Markdown" }); return; }
+      setState(userId, { pendingBtn: { label, url }, step: "confirm" });
       await ctx.reply(
-        t(lang, "msg.broadcastSent", { count: sent }),
-        { reply_markup: getAdminKeyboard(lang) }
+        t(lang, "msg.savedBtns.preview", { label, url }),
+        {
+          parse_mode: "Markdown",
+          reply_markup: new InlineKeyboard()
+            .text(t(lang, "ibtn.savedBtns.save"), "sbtn:save")
+            .text(t(lang, "ibtn.savedBtns.discard"), "sbtn:discard"),
+        }
       );
+      return;
+    }
+
+    // ── State: btn_gen (AI saved button generation) ────────────────────────
+    if (s.mode === "btn_gen" && userId === ADMIN_ID) {
+      await ctx.reply(t(lang, "msg.savedBtns.genThink"));
+      try {
+        const generated = await generateButtonViaAI(text.trim());
+        setState(userId, { pendingBtn: generated, step: "confirm" });
+        await ctx.reply(
+          t(lang, "msg.savedBtns.preview", { label: generated.label, url: generated.url }),
+          {
+            parse_mode: "Markdown",
+            reply_markup: new InlineKeyboard()
+              .text(t(lang, "ibtn.savedBtns.save"), "sbtn:save")
+              .text(t(lang, "ibtn.savedBtns.discard"), "sbtn:discard"),
+          }
+        );
+      } catch {
+        await ctx.reply(t(lang, "msg.savedBtns.genError"));
+      }
       return;
     }
 
@@ -1296,6 +1477,26 @@ bot.on("message:text", async (ctx) => {
       return;
     }
 
+    // ── State: gift_chat ──────────────────────────────────────────────────
+    if (s.mode === "gift_chat") {
+      await ctx.reply(t(lang, "msg.giftChatThink"));
+      try {
+        const history = s.giftHistory ?? [];
+        const { reply, history: newHistory } = await continueGiftChat(history, text);
+        setState(userId, { giftHistory: newHistory, lastGiftMsg: reply });
+        await ctx.reply(reply, {
+          reply_markup: new InlineKeyboard()
+            .text(t(lang, "ibtn.gift.another"), "gift:another").row()
+            .text(t(lang, "ibtn.gift.save"), "gift:save")
+            .text(t(lang, "ibtn.gift.close"), "gift:close"),
+        });
+      } catch (e) {
+        console.error("gift_chat error:", e.message);
+        await ctx.reply(t(lang, "msg.giftChatError"));
+      }
+      return;
+    }
+
     // ── State: talk ───────────────────────────────────────────────────────
     if (s.mode === "talk") {
       const reply = await gptTalk(userId, text);
@@ -1307,7 +1508,10 @@ bot.on("message:text", async (ctx) => {
     await ctx.reply(t(lang, "msg.useMenu"), { reply_markup: await getMainKeyboard(userId) });
   } catch (e) {
     console.error("message:text error:", e);
-    try { await ctx.reply("Что-то пошло не так. /cancel"); } catch {}
+    try {
+      const errLang = getLang(String(ctx.from.id));
+      await ctx.reply(t(errLang, "msg.error"), { reply_markup: await getMainKeyboard(String(ctx.from.id)) });
+    } catch {}
   }
 });
 
@@ -1340,6 +1544,13 @@ bot.on("callback_query:data", async (ctx) => {
     const lang = getLang(userId);
     const data = ctx.callbackQuery.data;
     const s = getState(userId);
+
+    if (data === "do_bind") {
+      clearState(userId);
+      setState(userId, { mode: "bind", lang });
+      await ctx.reply(t(lang, "msg.enterBuyerIdFull"));
+      return;
+    }
 
     if (data === "add_method:manual") {
       clearState(userId);
@@ -1430,6 +1641,210 @@ bot.on("callback_query:data", async (ctx) => {
       return;
     }
 
+    // ── Saved buttons management ──────────────────────────────────────────
+    if (data.startsWith("sbtn:") && userId === ADMIN_ID) {
+      const parts = data.split(":");
+      const action = parts[1];
+
+      if (action === "add_manual") {
+        clearState(userId);
+        setState(userId, { mode: "btn_add", lang });
+        await ctx.reply(t(lang, "msg.savedBtns.addManual"), { parse_mode: "Markdown" });
+        return;
+      }
+
+      if (action === "gen_ai") {
+        clearState(userId);
+        setState(userId, { mode: "btn_gen", lang });
+        await ctx.reply(t(lang, "msg.savedBtns.genPrompt"), { parse_mode: "Markdown" });
+        return;
+      }
+
+      if (action === "view") {
+        const btnId = parts[2];
+        const btn = await SavedButton.findOne({ id: btnId });
+        if (!btn) { await ctx.reply(t(lang, "msg.wishNotFound")); return; }
+        await ctx.reply(
+          `*${btn.label}*\n\`${btn.url}\``,
+          {
+            parse_mode: "Markdown",
+            reply_markup: new InlineKeyboard()
+              .url("🔗 Открыть", btn.url).row()
+              .text(t(lang, "ibtn.savedBtns.delete"), `sbtn:del:${btn.id}`)
+              .text(t(lang, "ibtn.savedBtns.back"), "sbtn:list"),
+          }
+        );
+        return;
+      }
+
+      if (action === "del") {
+        await SavedButton.deleteOne({ id: parts[2] });
+        await ctx.reply(t(lang, "msg.savedBtns.deleted"));
+        // Refresh list
+        const buttons = await SavedButton.find().sort({ createdAt: -1 });
+        const kb = new InlineKeyboard();
+        for (const btn of buttons) kb.text(btn.label, `sbtn:view:${btn.id}`).row();
+        kb.text(t(lang, "ibtn.savedBtns.addManual"), "sbtn:add_manual").row()
+          .text(t(lang, "ibtn.savedBtns.genAI"), "sbtn:gen_ai");
+        const msg = buttons.length ? t(lang, "msg.savedBtns.list", { count: buttons.length }) : t(lang, "msg.savedBtns.empty");
+        await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: kb });
+        return;
+      }
+
+      if (action === "list") {
+        const buttons = await SavedButton.find().sort({ createdAt: -1 });
+        const kb = new InlineKeyboard();
+        for (const btn of buttons) kb.text(btn.label, `sbtn:view:${btn.id}`).row();
+        kb.text(t(lang, "ibtn.savedBtns.addManual"), "sbtn:add_manual").row()
+          .text(t(lang, "ibtn.savedBtns.genAI"), "sbtn:gen_ai");
+        const msg = buttons.length ? t(lang, "msg.savedBtns.list", { count: buttons.length }) : t(lang, "msg.savedBtns.empty");
+        await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: kb });
+        return;
+      }
+
+      if (action === "save") {
+        const pending = s.pendingBtn;
+        if (!pending) { await ctx.reply(t(lang, "msg.cancelled"), { reply_markup: getAdminKeyboard(lang) }); return; }
+        await SavedButton.create({ id: crypto.randomUUID(), label: pending.label, url: pending.url });
+        clearState(userId);
+        setState(userId, { lang });
+        await ctx.reply(t(lang, "msg.savedBtns.saved"), { reply_markup: getAdminKeyboard(lang) });
+        return;
+      }
+
+      if (action === "discard") {
+        clearState(userId);
+        setState(userId, { lang });
+        await ctx.reply(t(lang, "msg.cancelled"), { reply_markup: getAdminKeyboard(lang) });
+        return;
+      }
+
+      // ── Pick saved button for broadcast ────────────────────────────────
+      if (action === "pick") {
+        const btnId = parts[2];
+        const btn = await SavedButton.findOne({ id: btnId });
+        if (!btn) return;
+        const current = s.broadcastButtons ?? [];
+        const already = current.find(b => b.url === btn.url);
+        if (!already) {
+          const updated = [...current, { text: btn.label, url: btn.url }];
+          setState(userId, { broadcastButtons: updated });
+        }
+        // Show updated selection
+        const selected = getState(userId).broadcastButtons ?? [];
+        const allBtns = await SavedButton.find().sort({ createdAt: -1 });
+        const kb = new InlineKeyboard();
+        for (const b of allBtns) {
+          const picked = selected.find(x => x.url === b.url);
+          kb.text(`${picked ? "✅ " : ""}${b.label}`, `sbtn:pick:${b.id}`).row();
+        }
+        kb.text(t(lang, "ibtn.bcast.done"), "bcast:from_saved_done")
+          .text(t(lang, "ibtn.bcast.cancel"), "bcast:cancel");
+        await ctx.editMessageReplyMarkup({ reply_markup: kb }).catch(() => {});
+        return;
+      }
+
+      return;
+    }
+
+    if (data.startsWith("bcast:") && userId === ADMIN_ID) {
+      const action = data.split(":")[1];
+
+      if (action === "add_btns") {
+        setState(userId, { step: "buttons" });
+        await ctx.reply(t(lang, "msg.broadcastAddBtns"), { parse_mode: "Markdown" });
+        return;
+      }
+
+      if (action === "gen_ai") {
+        setState(userId, { step: "gen_btn" });
+        await ctx.reply(t(lang, "msg.savedBtns.genPrompt"), { parse_mode: "Markdown" });
+        return;
+      }
+
+      if (action === "from_saved") {
+        const allBtns = await SavedButton.find().sort({ createdAt: -1 });
+        if (!allBtns.length) {
+          await ctx.reply(t(lang, "msg.savedBtns.empty"), { parse_mode: "Markdown" });
+          return;
+        }
+        const kb = new InlineKeyboard();
+        for (const b of allBtns) kb.text(b.label, `sbtn:pick:${b.id}`).row();
+        kb.text(t(lang, "ibtn.bcast.done"), "bcast:from_saved_done")
+          .text(t(lang, "ibtn.bcast.cancel"), "bcast:cancel");
+        await ctx.reply(t(lang, "msg.bcast.pickSaved"), { reply_markup: kb });
+        return;
+      }
+
+      if (action === "from_saved_done") {
+        const buttons = s.broadcastButtons ?? [];
+        if (!buttons.length) {
+          await ctx.reply(t(lang, "msg.broadcastBadBtns"), { parse_mode: "Markdown" });
+          return;
+        }
+        setState(userId, { step: "confirm" });
+        const previewKb = new InlineKeyboard();
+        buttons.forEach(b => { previewKb.url(b.text, b.url); previewKb.row(); });
+        await ctx.reply(t(lang, "msg.broadcastPreview"), { parse_mode: "Markdown" });
+        await ctx.reply(s.broadcastText, { reply_markup: previewKb });
+        await ctx.reply(t(lang, "msg.broadcastConfirm"), {
+          reply_markup: new InlineKeyboard()
+            .text(t(lang, "ibtn.bcast.confirm"), "bcast:confirm").row()
+            .text(t(lang, "ibtn.bcast.editBtns"), "bcast:edit_btns")
+            .text(t(lang, "ibtn.bcast.cancel"), "bcast:cancel"),
+        });
+        return;
+      }
+
+      if (action === "send_now") {
+        const message = s.broadcastText;
+        if (!message) { await ctx.reply(t(lang, "msg.cancelled"), { reply_markup: getAdminKeyboard(lang) }); return; }
+        const users = await User.find({}, "userId");
+        let sent = 0;
+        for (const user of users) {
+          try { await bot.api.sendMessage(user.userId, message); sent++; } catch {}
+        }
+        clearState(userId);
+        setState(userId, { lang });
+        await ctx.reply(t(lang, "msg.broadcastSent", { count: sent }), { reply_markup: getAdminKeyboard(lang) });
+        return;
+      }
+
+      if (action === "confirm") {
+        const message = s.broadcastText;
+        const buttons = s.broadcastButtons;
+        if (!message) { await ctx.reply(t(lang, "msg.cancelled"), { reply_markup: getAdminKeyboard(lang) }); return; }
+        const bcastKb = buttons?.length ? new InlineKeyboard() : null;
+        if (bcastKb) buttons.forEach(b => { bcastKb.url(b.text, b.url); bcastKb.row(); });
+        const users = await User.find({}, "userId");
+        let sent = 0;
+        for (const user of users) {
+          try {
+            await bot.api.sendMessage(user.userId, message, bcastKb ? { reply_markup: bcastKb } : {});
+            sent++;
+          } catch {}
+        }
+        clearState(userId);
+        setState(userId, { lang });
+        await ctx.reply(t(lang, "msg.broadcastSent", { count: sent }), { reply_markup: getAdminKeyboard(lang) });
+        return;
+      }
+
+      if (action === "edit_btns") {
+        setState(userId, { step: "buttons" });
+        await ctx.reply(t(lang, "msg.broadcastAddBtns"), { parse_mode: "Markdown" });
+        return;
+      }
+
+      if (action === "cancel") {
+        clearState(userId);
+        setState(userId, { lang });
+        await ctx.reply(t(lang, "msg.cancelled"), { reply_markup: getAdminKeyboard(lang) });
+        return;
+      }
+      return;
+    }
+
     if (data.startsWith("setlang:")) {
       const newLang = data.split(":")[1];
       if (!["ru", "uk", "en"].includes(newLang)) return;
@@ -1437,6 +1852,89 @@ bot.on("callback_query:data", async (ctx) => {
       await User.updateOne({ userId }, { $set: { lang: newLang, langSet: true } });
       try { await ctx.editMessageReplyMarkup(); } catch {}
       await ctx.reply(t(newLang, "msg.langChanged"), { reply_markup: getSettingsKeyboard(newLang) });
+      return;
+    }
+
+    // ── Gift chat callbacks ────────────────────────────────────────────────
+    if (data.startsWith("gift:")) {
+      const action = data.split(":")[1];
+
+      if (action === "auto") {
+        await ctx.reply(t(lang, "msg.giftChatThink"));
+        try {
+          const { reply, history } = await startGiftChat(userId);
+          setState(userId, { mode: "gift_chat", giftHistory: history, lastGiftMsg: reply });
+          await ctx.reply(reply, {
+            reply_markup: new InlineKeyboard()
+              .text(t(lang, "ibtn.gift.another"), "gift:another").row()
+              .text(t(lang, "ibtn.gift.save"), "gift:save")
+              .text(t(lang, "ibtn.gift.close"), "gift:close"),
+          });
+        } catch (e) {
+          console.error("gift:auto error:", e.message);
+          await ctx.reply(t(lang, "msg.giftChatError"));
+        }
+        return;
+      }
+
+      if (action === "another") {
+        await ctx.reply(t(lang, "msg.giftChatThink"));
+        try {
+          const history = s.giftHistory ?? [];
+          const { reply, history: newHistory } = await continueGiftChat(history, "Please suggest a completely different gift option.");
+          setState(userId, { giftHistory: newHistory, lastGiftMsg: reply });
+          await ctx.reply(reply, {
+            reply_markup: new InlineKeyboard()
+              .text(t(lang, "ibtn.gift.another"), "gift:another").row()
+              .text(t(lang, "ibtn.gift.save"), "gift:save")
+              .text(t(lang, "ibtn.gift.close"), "gift:close"),
+          });
+        } catch (e) {
+          console.error("gift:another error:", e.message);
+          await ctx.reply(t(lang, "msg.giftChatError"));
+        }
+        return;
+      }
+
+      if (action === "save") {
+        const lastMsg = s.lastGiftMsg;
+        if (!lastMsg) { await ctx.reply(t(lang, "msg.error")); return; }
+        try {
+          const product = await extractGiftProduct(lastMsg);
+          if (!product || !product.title) { await ctx.reply(t(lang, "msg.giftChatError")); return; }
+          const buyerId = await getBuyerId(userId);
+          const wish = new Wish({
+            id: generateId(),
+            ownerId: userId,
+            buyerId: buyerId ?? null,
+            title: product.title,
+            link: product.url ?? "",
+            price: product.price ?? t(lang, "msg.priceUnknown"),
+            photoFileId: null,
+            photoUrl: null,
+            priority: 2,
+            status: "new",
+            noteFromBuyer: "",
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          });
+          await wish.save();
+          clearState(userId);
+          setState(userId, { lang });
+          await ctx.reply(t(lang, "msg.gift.saved"), { reply_markup: await getMainKeyboard(userId) });
+        } catch (e) {
+          console.error("gift:save error:", e.message);
+          await ctx.reply(t(lang, "msg.error"));
+        }
+        return;
+      }
+
+      if (action === "close") {
+        clearState(userId);
+        setState(userId, { lang });
+        await ctx.reply(t(lang, "msg.menu"), { reply_markup: await getMainKeyboard(userId) });
+        return;
+      }
       return;
     }
   } catch (e) {
