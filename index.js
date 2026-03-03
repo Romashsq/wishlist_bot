@@ -1763,7 +1763,7 @@ bot.on("callback_query:data", async (ctx) => {
       const ownerUser = await User.findOne({ userId: wish.ownerId });
       await Wish.findOneAndUpdate(
         { id: wishId },
-        { pledgedBy: userId, pledgedByName: ctx.from.first_name || "Гость" }
+        { pledgedBy: userId, pledgedByName: ctx.from.first_name || "Гость", pledgeStatus: "planned" }
       );
       const holidayName = getHolidayName(lang, wish.holiday ?? "birthday");
       await ctx.reply(
@@ -1781,7 +1781,7 @@ bot.on("callback_query:data", async (ctx) => {
       const wishId = data.split(":")[1];
       const wish = await Wish.findOneAndUpdate(
         { id: wishId },
-        { pledgedBy: userId, pledgedByName: ctx.from.first_name || "Гость" },
+        { pledgedBy: userId, pledgedByName: ctx.from.first_name || "Гость", pledgeStatus: "planned" },
         { new: true }
       );
       if (!wish) { await ctx.reply(t(lang, "msg.wishNotFound")); return; }
@@ -1827,7 +1827,10 @@ bot.on("callback_query:data", async (ctx) => {
     // ─── My Gifts category navigation ─────────────────────────────────────
     if (data.startsWith("mygifts:")) {
       const category = data.split(":")[1]; // "planned" | "bought" | "deferred"
-      const wishes = await Wish.find({ pledgedBy: userId, pledgeStatus: category });
+      const statusQuery = category === "planned"
+        ? { $in: ["planned", null] }
+        : category;
+      const wishes = await Wish.find({ pledgedBy: userId, pledgeStatus: statusQuery });
       if (!wishes.length) {
         await ctx.reply(t(lang, "msg.pledges.empty"));
         return;
