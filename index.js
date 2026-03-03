@@ -110,7 +110,7 @@ async function getMainKeyboard(userId) {
   ];
   if (buyer) rows.push([t(lang, "btn.partnerWishes"), t(lang, "btn.history")]);
   rows.push([t(lang, "btn.chat"), t(lang, "btn.settings"), t(lang, "btn.langSettings")]);
-  rows.push([t(lang, "btn.donate"), t(lang, "btn.review")]);
+  rows.push([t(lang, "btn.donate")]);
   if (String(userId) === ADMIN_ID) rows.push([t(lang, "btn.admin")]);
   return Keyboard.from(rows).resized();
 }
@@ -134,6 +134,7 @@ function getAdminKeyboard(lang) {
   return Keyboard.from([
     [t(lang, "btn.broadcast"), t(lang, "btn.stats")],
     [t(lang, "btn.donateBroadcast"), t(lang, "btn.savedButtons")],
+    [t(lang, "btn.reviewBroadcast")],
     [t(lang, "btn.back")],
   ]).resized();
 }
@@ -992,6 +993,30 @@ bot.on("message:text", async (ctx) => {
     if (text === t(lang, "btn.donateBroadcast") && userId === ADMIN_ID) {
       setState(userId, { mode: "donate_broadcast" });
       await ctx.reply(t(lang, "msg.donateAskAmount"), { parse_mode: "Markdown" });
+      return;
+    }
+
+    if (text === t(lang, "btn.reviewBroadcast") && userId === ADMIN_ID) {
+      const users = await User.find({}, "userId lang");
+      let sent = 0;
+      for (const user of users) {
+        try {
+          const uLang = user.lang ?? "ru";
+          await bot.api.sendMessage(
+            user.userId,
+            t(uLang, "msg.reviewBroadcastText"),
+            {
+              reply_markup: new InlineKeyboard()
+                .text(t(uLang, "ibtn.writeReview"), "review:start"),
+            }
+          );
+          sent++;
+        } catch { /* skip blocked users */ }
+      }
+      await ctx.reply(
+        t(lang, "msg.reviewBroadcastSent", { count: sent }),
+        { reply_markup: getAdminKeyboard(lang) }
+      );
       return;
     }
 
@@ -1883,6 +1908,13 @@ bot.on("callback_query:data", async (ctx) => {
       await User.updateOne({ userId }, { $set: { lang: newLang, langSet: true } });
       try { await ctx.editMessageReplyMarkup(); } catch {}
       await ctx.reply(t(newLang, "msg.langChanged"), { reply_markup: getSettingsKeyboard(newLang) });
+      return;
+    }
+
+    // ── Review callbacks ──────────────────────────────────────────────────
+    if (data === "review:start") {
+      setState(userId, { mode: "review" });
+      await ctx.reply(t(lang, "msg.reviewPrompt"), { parse_mode: "Markdown" });
       return;
     }
 
