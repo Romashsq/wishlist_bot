@@ -362,17 +362,49 @@ async function sendConfirmPreview(ctx, s, lang) {
 }
 
 // ─── GPT helpers ─────────────────────────────────────────────────────────
-async function gptRequest(messages) {
+async function gptRequest(messages, maxTokens = 300) {
   try {
     const res = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages,
-      max_tokens: 300,
+      max_tokens: maxTokens,
       temperature: 0.9,
     });
     return res.choices[0].message.content.trim();
   } catch (e) {
     console.error("GPT error:", e.message);
+    return "Ой, у меня сейчас мозговой туман 🌫️";
+  }
+}
+
+// sendMessageDraft streaming (Bot API 9.5+)
+const DRAFT_INTERVAL_MS = 350;
+async function streamedGptReply(messages, chatId, maxTokens = 400) {
+  try {
+    const stream = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages,
+      max_tokens: maxTokens,
+      temperature: 0.9,
+      stream: true,
+    });
+    let text = "";
+    let lastDraftAt = 0;
+    for await (const chunk of stream) {
+      const delta = chunk.choices[0]?.delta?.content || "";
+      if (!delta) continue;
+      text += delta;
+      const now = Date.now();
+      if (now - lastDraftAt >= DRAFT_INTERVAL_MS && text.length >= 10) {
+        lastDraftAt = now;
+        try {
+          await bot.api.raw.sendMessageDraft({ chat_id: chatId, text });
+        } catch { /* Bot API < 9.5 or rate limit — silently skip */ }
+      }
+    }
+    return text.trim() || "Ой, у меня сейчас мозговой туман 🌫️";
+  } catch (e) {
+    console.error("GPT streaming error:", e.message);
     return "Ой, у меня сейчас мозговой туман 🌫️";
   }
 }
@@ -391,7 +423,7 @@ async function gptWishComment(title) {
   ]);
 }
 
-async function gptTalk(userId, userMessage) {
+async function gptTalk(userId, userMessage, chatId = null) {
   const s = getState(userId);
   const history = Array.isArray(s.chatHistory) ? s.chatHistory : [];
   const messages = [
@@ -421,7 +453,9 @@ STYLE RULES:
     ...history,
     { role: "user", content: userMessage },
   ];
-  const reply = await gptRequest(messages);
+  const reply = chatId
+    ? await streamedGptReply(messages, chatId, 300)
+    : await gptRequest(messages, 300);
   const newHistory = [
     ...history,
     { role: "user", content: userMessage },
@@ -453,7 +487,7 @@ HOW TO SUGGEST:
 LANGUAGE: Always respond in the SAME language the user is writing in.
 Keep each response under 200 words.`;
 
-async function startGiftChat(targetUserId) {
+async function startGiftChat(targetUserId, chatId = null) {
   const wishes = await Wish.find({ ownerId: targetUserId, status: { $ne: "archived" } });
   const wishList = wishes.map((w) => `"${w.title}" (${w.price})`).join(", ");
   const userMsg = wishList
@@ -464,17 +498,21 @@ async function startGiftChat(targetUserId) {
     { role: "system", content: GIFT_SYSTEM_PROMPT },
     { role: "user", content: userMsg },
   ];
-  const reply = await gptRequest(messages);
+  const reply = chatId
+    ? await streamedGptReply(messages, chatId, 400)
+    : await gptRequest(messages, 400);
   return { reply, history: [...messages, { role: "assistant", content: reply }] };
 }
 
-async function continueGiftChat(history, userMessage) {
+async function continueGiftChat(history, userMessage, chatId = null) {
   const messages = [
     { role: "system", content: GIFT_SYSTEM_PROMPT },
     ...history,
     { role: "user", content: userMessage },
   ];
-  const reply = await gptRequest(messages);
+  const reply = chatId
+    ? await streamedGptReply(messages, chatId, 400)
+    : await gptRequest(messages, 400);
   const newHistory = [...history, { role: "user", content: userMessage }, { role: "assistant", content: reply }];
   if (newHistory.length > 16) newHistory.splice(0, 2);
   return { reply, history: newHistory };
@@ -2021,10 +2059,9 @@ bot.on("message:text", async (ctx) => {
 
     // ── State: gift_chat ──────────────────────────────────────────────────
     if (s.mode === "gift_chat") {
-      await ctx.reply(t(lang, "msg.giftChatThink"));
       try {
         const history = s.giftHistory ?? [];
-        const { reply, history: newHistory } = await continueGiftChat(history, text);
+        const { reply, history: newHistory } = await continueGiftChat(history, text, ctx.chat.id);
         setState(userId, { giftHistory: newHistory, lastGiftMsg: reply });
         await ctx.reply(reply, {
           reply_markup: new InlineKeyboard()
@@ -2041,7 +2078,7 @@ bot.on("message:text", async (ctx) => {
 
     // ── State: talk ───────────────────────────────────────────────────────
     if (s.mode === "talk") {
-      const reply = await gptTalk(userId, text);
+      const reply = await gptTalk(userId, text, ctx.chat.id);
       await ctx.reply(reply);
       return;
     }
@@ -2875,9 +2912,8 @@ bot.on("callback_query:data", async (ctx) => {
         const targetUser = await User.findOne({ userId: targetId });
         const targetName = targetUser?.firstName || "?";
         setState(userId, { mode: "gift_chat", giftHistory: [], lang, giftTargetId: targetId });
-        await ctx.reply(t(lang, "msg.giftChatThink"));
         try {
-          const { reply, history } = await startGiftChat(targetId);
+          const { reply, history } = await startGiftChat(targetId, ctx.chat.id);
           setState(userId, { mode: "gift_chat", giftHistory: history, lastGiftMsg: reply, giftTargetId: targetId, giftTargetName: targetName });
           const isSelf = targetId === userId;
           const header = isSelf ? "" : t(lang, "msg.giftForPerson", { name: escMd(targetName) }) + "\n\n";
@@ -2897,9 +2933,8 @@ bot.on("callback_query:data", async (ctx) => {
 
       if (action === "auto") {
         // Legacy fallback — redirect to self
-        await ctx.reply(t(lang, "msg.giftChatThink"));
         try {
-          const { reply, history } = await startGiftChat(userId);
+          const { reply, history } = await startGiftChat(userId, ctx.chat.id);
           setState(userId, { mode: "gift_chat", giftHistory: history, lastGiftMsg: reply, giftTargetId: userId });
           await ctx.reply(reply, {
             reply_markup: new InlineKeyboard()
@@ -2915,10 +2950,9 @@ bot.on("callback_query:data", async (ctx) => {
       }
 
       if (action === "another") {
-        await ctx.reply(t(lang, "msg.giftChatThink"));
         try {
           const history = s.giftHistory ?? [];
-          const { reply, history: newHistory } = await continueGiftChat(history, "Please suggest a completely different gift option.");
+          const { reply, history: newHistory } = await continueGiftChat(history, "Please suggest a completely different gift option.", ctx.chat.id);
           setState(userId, { giftHistory: newHistory, lastGiftMsg: reply });
           await ctx.reply(reply, {
             reply_markup: new InlineKeyboard()
