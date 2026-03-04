@@ -863,6 +863,20 @@ async function showBuyerHistory(ctx, lang) {
   for (const wish of slice) await sendWishCard(ctx, buyerId, wish, undefined, lang, true);
 }
 
+// Sends a broadcast message (photo or text) to a single chat via bot.api
+async function sendBcastToChat(api, chatId, s, kb) {
+  const opts = kb ? { reply_markup: kb } : {};
+  if (s.broadcastPhotoFileId) {
+    await api.sendPhoto(chatId, s.broadcastPhotoFileId, {
+      caption: s.broadcastText || undefined,
+      parse_mode: s.broadcastText ? "Markdown" : undefined,
+      ...opts,
+    });
+  } else {
+    await api.sendMessage(chatId, s.broadcastText, opts);
+  }
+}
+
 async function updateWishStatus(ctx, buyerId, wishId, status, lang) {
   const wish = await Wish.findOneAndUpdate(
     { id: wishId },
@@ -1464,7 +1478,7 @@ bot.on("message:text", async (ctx) => {
           const previewKb = new InlineKeyboard();
           bcastBtns.forEach(b => { previewKb.url(b.text, b.url); previewKb.row(); });
           await ctx.reply(t(lang, "msg.broadcastPreview"), { parse_mode: "Markdown" });
-          await ctx.reply(s.broadcastText, { reply_markup: previewKb });
+          await sendBcastToChat(ctx.api, ctx.chat.id, { ...getState(userId), broadcastButtons: bcastBtns }, previewKb);
           await ctx.reply(t(lang, "msg.broadcastConfirm"), {
             reply_markup: new InlineKeyboard()
               .text(t(lang, "ibtn.bcast.confirm"), "bcast:confirm").row()
@@ -1492,7 +1506,7 @@ bot.on("message:text", async (ctx) => {
         const previewKb = new InlineKeyboard();
         buttons.forEach(b => { previewKb.url(b.text, b.url); previewKb.row(); });
         await ctx.reply(t(lang, "msg.broadcastPreview"), { parse_mode: "Markdown" });
-        await ctx.reply(s.broadcastText, { reply_markup: previewKb });
+        await sendBcastToChat(ctx.api, ctx.chat.id, s, previewKb);
         await ctx.reply(t(lang, "msg.broadcastConfirm"), {
           reply_markup: new InlineKeyboard()
             .text(t(lang, "ibtn.bcast.confirm"), "bcast:confirm").row()
@@ -1988,6 +2002,22 @@ bot.on("message:photo", async (ctx) => {
       const best = photos[photos.length - 1];
       setState(userId, { photoFileId: best.file_id, photoUrl: null, step: "title" });
       await ctx.reply(t(lang, "msg.enterTitle"));
+      return;
+    }
+
+    // Broadcast with photo
+    if (s.mode === "broadcast" && s.step === "text" && userId === ADMIN_ID) {
+      const photos = ctx.message.photo;
+      const best = photos[photos.length - 1];
+      const caption = ctx.message.caption?.trim() || "";
+      setState(userId, { broadcastPhotoFileId: best.file_id, broadcastText: caption, step: "after_text" });
+      const savedCount = await SavedButton.countDocuments();
+      const kb = new InlineKeyboard()
+        .text(t(lang, "ibtn.bcast.addBtns"), "bcast:add_btns").row()
+        .text(t(lang, "ibtn.bcast.genAI"), "bcast:gen_ai");
+      if (savedCount > 0) kb.row().text(t(lang, "ibtn.bcast.fromSaved"), "bcast:from_saved");
+      kb.row().text(t(lang, "ibtn.bcast.sendNow"), "bcast:send_now");
+      await ctx.reply(t(lang, "msg.broadcastTextSaved"), { reply_markup: kb });
       return;
     }
 
@@ -2561,7 +2591,7 @@ bot.on("callback_query:data", async (ctx) => {
         const previewKb = new InlineKeyboard();
         buttons.forEach(b => { previewKb.url(b.text, b.url); previewKb.row(); });
         await ctx.reply(t(lang, "msg.broadcastPreview"), { parse_mode: "Markdown" });
-        await ctx.reply(s.broadcastText, { reply_markup: previewKb });
+        await sendBcastToChat(ctx.api, ctx.chat.id, s, previewKb);
         await ctx.reply(t(lang, "msg.broadcastConfirm"), {
           reply_markup: new InlineKeyboard()
             .text(t(lang, "ibtn.bcast.confirm"), "bcast:confirm").row()
@@ -2572,12 +2602,14 @@ bot.on("callback_query:data", async (ctx) => {
       }
 
       if (action === "send_now") {
-        const message = s.broadcastText;
-        if (!message) { await ctx.reply(t(lang, "msg.cancelled"), { reply_markup: getAdminKeyboard(lang) }); return; }
+        if (!s.broadcastText && !s.broadcastPhotoFileId) {
+          await ctx.reply(t(lang, "msg.cancelled"), { reply_markup: getAdminKeyboard(lang) });
+          return;
+        }
         const users = await User.find({}, "userId");
         let sent = 0;
         for (const user of users) {
-          try { await bot.api.sendMessage(user.userId, message); sent++; } catch {}
+          try { await sendBcastToChat(bot.api, user.userId, s, null); sent++; } catch {}
         }
         clearState(userId);
         setState(userId, { lang });
@@ -2586,18 +2618,17 @@ bot.on("callback_query:data", async (ctx) => {
       }
 
       if (action === "confirm") {
-        const message = s.broadcastText;
+        if (!s.broadcastText && !s.broadcastPhotoFileId) {
+          await ctx.reply(t(lang, "msg.cancelled"), { reply_markup: getAdminKeyboard(lang) });
+          return;
+        }
         const buttons = s.broadcastButtons;
-        if (!message) { await ctx.reply(t(lang, "msg.cancelled"), { reply_markup: getAdminKeyboard(lang) }); return; }
         const bcastKb = buttons?.length ? new InlineKeyboard() : null;
         if (bcastKb) buttons.forEach(b => { bcastKb.url(b.text, b.url); bcastKb.row(); });
         const users = await User.find({}, "userId");
         let sent = 0;
         for (const user of users) {
-          try {
-            await bot.api.sendMessage(user.userId, message, bcastKb ? { reply_markup: bcastKb } : {});
-            sent++;
-          } catch {}
+          try { await sendBcastToChat(bot.api, user.userId, s, bcastKb); sent++; } catch {}
         }
         clearState(userId);
         setState(userId, { lang });

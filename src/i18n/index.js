@@ -159,7 +159,7 @@ const translations = {
     "msg.reviewsEmpty":         "Отзывов пока нет.",
     "msg.reviewsHeader":        "💬 *Отзывы* ({count}):\n\n",
     "msg.reviewItem":           "👤 *{name}*{username} (ID: `{id}`)\n🕐 {date}\n_{text}_",
-    "msg.broadcastPrompt":      "Введи сообщение для рассылки всем пользователям:\n\n/cancel — отмена",
+    "msg.broadcastPrompt":      "Введи сообщение для рассылки (или отправь фото с подписью):\n\n/cancel — отмена",
     "msg.broadcastSent":        "✅ Рассылка отправлена {count} пользователям.",
     "msg.stats":                "👥 *Статистика*\n\nВсего пользователей: *{users}*\nАктивных хотелок: *{wishes}*",
     "msg.donateAskAmount":      "Введи сумму доната в Stars ⭐\n\nНапример: *50*\n\n/cancel — отмена",
