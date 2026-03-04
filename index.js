@@ -13,6 +13,7 @@ import Wish from "./src/models/Wish.js";
 import Binding from "./src/models/Binding.js";
 import SavedButton from "./src/models/SavedButton.js";
 import Review from "./src/models/Review.js";
+import Partnership from "./src/models/Partnership.js";
 import { t, detectLang } from "./src/i18n/index.js";
 
 // ─── OpenAI ───────────────────────────────────────────────────────────────
@@ -121,7 +122,7 @@ async function getMainKeyboard(userId) {
 function getSecondaryKeyboard(userId) {
   const lang = getLang(String(userId));
   const rows = [
-    [t(lang, "btn.holidays")],
+    [t(lang, "btn.holidays"), t(lang, "btn.partners")],
     [t(lang, "btn.chat"), t(lang, "btn.settings")],
     [t(lang, "btn.langSettings"), t(lang, "btn.donate")],
     [t(lang, "btn.review")],
@@ -779,8 +780,34 @@ async function showOwnerWishes(ctx, lang) {
 }
 
 async function showPartnerWishes(ctx, lang) {
-  const buyerId = String(ctx.from.id);
-  const ownerId = await getOwnerId(buyerId);
+  const viewerId = String(ctx.from.id);
+
+  // Check for multi-partner partnerships first
+  const partnerships = await Partnership.find({ fromUserId: viewerId });
+  if (partnerships.length > 0) {
+    const ownerIds = partnerships.map(p => p.toUserId);
+    const owners = await User.find({ userId: { $in: ownerIds } });
+    const ownerMap = Object.fromEntries(owners.map(u => [u.userId, u.firstName || "?"]));
+
+    if (partnerships.length === 1) {
+      // Only one partner — go straight to their wishes
+      const p = partnerships[0];
+      await showWishesOfPartner(ctx, viewerId, p.toUserId, ownerMap[p.toUserId] || "?", p.role, lang);
+      return;
+    }
+
+    // Multiple partners — show selection list
+    const kb = new InlineKeyboard();
+    for (const p of partnerships) {
+      const name = ownerMap[p.toUserId] || "?";
+      kb.text(`${name} (${p.role})`, `partner_wishes:${p.toUserId}`).row();
+    }
+    await ctx.reply(t(lang, "msg.choosePartner"), { parse_mode: "Markdown", reply_markup: kb });
+    return;
+  }
+
+  // Fallback: old single-binding system
+  const ownerId = await getOwnerId(viewerId);
   if (!ownerId) {
     await ctx.reply(t(lang, "msg.notBoundAsBuyer"));
     return;
@@ -792,7 +819,23 @@ async function showPartnerWishes(ctx, lang) {
   }
   const slice = wishes.slice(-10);
   await ctx.reply(t(lang, "msg.partnerWishesHeader", { count: slice.length }), { parse_mode: "Markdown" });
-  for (const wish of slice) await sendWishCard(ctx, buyerId, wish, getBuyerWishKeyboard(wish.id, lang), lang, true);
+  for (const wish of slice) await sendWishCard(ctx, viewerId, wish, getBuyerWishKeyboard(wish.id, lang), lang, true);
+}
+
+async function showWishesOfPartner(ctx, viewerId, ownerId, ownerName, role, lang) {
+  const wishes = await Wish.find({ ownerId, status: { $ne: "archived" } }).sort({ createdAt: 1 });
+  if (wishes.length === 0) {
+    await ctx.reply(t(lang, "msg.partnerNoWishes"));
+    return;
+  }
+  const slice = wishes.slice(-10);
+  await ctx.reply(
+    t(lang, "msg.viewingWishesOf", { name: escMd(ownerName), role: escMd(role) }),
+    { parse_mode: "Markdown" }
+  );
+  for (const wish of slice) {
+    await sendWishCard(ctx, viewerId, wish, getBuyerWishKeyboard(wish.id, lang), lang, true);
+  }
 }
 
 async function showBuyerHistory(ctx, lang) {
@@ -1265,6 +1308,30 @@ bot.on("message:text", async (ctx) => {
       return;
     }
 
+    if (text === t(lang, "btn.partners")) {
+      const partnerships = await Partnership.find({ fromUserId: userId });
+      if (!partnerships.length) {
+        const kb = new InlineKeyboard().text(t(lang, "ibtn.addPartner"), "partners:add");
+        await ctx.reply(t(lang, "msg.partnersEmpty"), { reply_markup: kb });
+        return;
+      }
+      const ownerIds = partnerships.map(p => p.toUserId);
+      const owners = await User.find({ userId: { $in: ownerIds } });
+      const ownerMap = Object.fromEntries(owners.map(u => [u.userId, u.firstName || "?"]));
+      const kb = new InlineKeyboard();
+      for (const p of partnerships) {
+        const name = ownerMap[p.toUserId] || "?";
+        kb.text(`🎁 ${name} (${p.role})`, `partner_wishes:${p.toUserId}`);
+        kb.text("🗑", `partner_remove:${p.toUserId}`).row();
+      }
+      kb.text(t(lang, "ibtn.addPartner"), "partners:add");
+      await ctx.reply(
+        t(lang, "msg.partnersMenu", { count: partnerships.length }),
+        { parse_mode: "Markdown", reply_markup: kb }
+      );
+      return;
+    }
+
     if (text === t(lang, "btn.mainMenu")) {
       await ctx.reply(t(lang, "msg.menu"), { reply_markup: await getMainKeyboard(userId) });
       return;
@@ -1565,6 +1632,55 @@ bot.on("message:text", async (ctx) => {
       return;
     }
 
+    // ── State: add_partner ────────────────────────────────────────────────
+    if (s.mode === "add_partner") {
+      if (s.step === "id") {
+        const input = text.trim();
+        if (!/^\d+$/.test(input)) {
+          await ctx.reply(t(lang, "msg.idDigitsOnly"));
+          return;
+        }
+        if (input === userId) {
+          await ctx.reply(t(lang, "msg.partnerSelf"));
+          return;
+        }
+        const existing = await Partnership.findOne({ fromUserId: userId, toUserId: input });
+        if (existing) {
+          await ctx.reply(t(lang, "msg.partnerAlreadyAdded"));
+          return;
+        }
+        const partnerUser = await User.findOne({ userId: input });
+        if (!partnerUser) {
+          await ctx.reply(t(lang, "msg.partnerNotFound"));
+          return;
+        }
+        setState(userId, { ...s, step: "role", pendingPartnerId: input, pendingPartnerName: partnerUser.firstName || "?" });
+        const kb = new InlineKeyboard()
+          .text(t(lang, "ibtn.role.partner"), "partner_role:❤️ Партнёр").row()
+          .text(t(lang, "ibtn.role.friend"),  "partner_role:🤝 Друг").row()
+          .text(t(lang, "ibtn.role.parent"),  "partner_role:👨‍👩‍👧 Родитель").row()
+          .text(t(lang, "ibtn.role.child"),   "partner_role:👶 Ребёнок").row()
+          .text(t(lang, "ibtn.role.sibling"), "partner_role:👫 Брат/Сестра");
+        await ctx.reply(
+          t(lang, "msg.enterPartnerRole", { name: escMd(partnerUser.firstName || "?") }),
+          { parse_mode: "Markdown", reply_markup: kb }
+        );
+        return;
+      }
+      if (s.step === "role") {
+        // User typed a custom role
+        const role = text.trim().slice(0, 30);
+        await Partnership.create({ fromUserId: userId, toUserId: s.pendingPartnerId, role });
+        clearState(userId);
+        setState(userId, { lang });
+        await ctx.reply(
+          t(lang, "msg.partnerAdded", { name: escMd(s.pendingPartnerName || "?"), role: escMd(role) }),
+          { parse_mode: "Markdown", reply_markup: await getMainKeyboard(userId) }
+        );
+        return;
+      }
+    }
+
     // ── State: add (manual flow) ──────────────────────────────────────────
     if (s.mode === "add") {
       if (s.step === "photo") {
@@ -1842,6 +1958,44 @@ bot.on("callback_query:data", async (ctx) => {
     const lang = getLang(userId);
     const data = ctx.callbackQuery.data;
     const s = getState(userId);
+
+    // ─── Partners callbacks ───────────────────────────────────────────────
+    if (data === "partners:add") {
+      clearState(userId);
+      setState(userId, { mode: "add_partner", step: "id", lang });
+      await ctx.reply(t(lang, "msg.enterPartnerId"));
+      return;
+    }
+
+    if (data.startsWith("partner_role:")) {
+      const role = data.slice("partner_role:".length);
+      const s2 = getState(userId);
+      if (s2.mode !== "add_partner" || !s2.pendingPartnerId) return;
+      await Partnership.create({ fromUserId: userId, toUserId: s2.pendingPartnerId, role });
+      clearState(userId);
+      setState(userId, { lang });
+      await ctx.reply(
+        t(lang, "msg.partnerAdded", { name: escMd(s2.pendingPartnerName || "?"), role: escMd(role) }),
+        { parse_mode: "Markdown", reply_markup: await getMainKeyboard(userId) }
+      );
+      return;
+    }
+
+    if (data.startsWith("partner_wishes:")) {
+      const toUserId = data.split(":")[1];
+      const p = await Partnership.findOne({ fromUserId: userId, toUserId });
+      const ownerUser = await User.findOne({ userId: toUserId });
+      if (!ownerUser) { await ctx.reply(t(lang, "msg.partnerNotFound")); return; }
+      await showWishesOfPartner(ctx, userId, toUserId, ownerUser.firstName || "?", p?.role || "?", lang);
+      return;
+    }
+
+    if (data.startsWith("partner_remove:")) {
+      const toUserId = data.split(":")[1];
+      await Partnership.deleteOne({ fromUserId: userId, toUserId });
+      await ctx.reply(t(lang, "msg.partnerRemoved"), { reply_markup: await getMainKeyboard(userId) });
+      return;
+    }
 
     // ─── Link retry / manual fallback / cancel ────────────────────────────
     if (data === "link_retry") {
