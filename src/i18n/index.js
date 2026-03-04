@@ -268,6 +268,17 @@ const translations = {
     "holiday.name.newyear":   "Новый год",
     "holiday.name.valentine": "День Святого Валентина",
 
+    // ─── Birthday reminders ─────────────────────────────────────────────────
+    "btn.birthday":           "🎂 День рождения",
+    "msg.enterBirthday":      "Введи дату рождения в формате *ДД.ММ*\nНапример: *15.03* (15 марта)\n\nДрузья, добавившие тебя как партнёра, получат напоминание за 3 дня до праздника 🎉",
+    "msg.birthdayAlreadySet": "🎂 Твой день рождения: *{date}*\n\nВведи новую дату чтобы изменить:",
+    "msg.birthdaySet":        "✅ День рождения установлен: *{date}* 🎂\n\nДрузья получат напоминание за 3 дня!",
+    "msg.birthdayInvalid":    "❌ Неверный формат. Введи дату как *ДД.ММ*, например: *15.03*",
+    "msg.birthdayRemoved":    "✅ День рождения удалён.",
+    "ibtn.removeBirthday":    "🗑 Удалить дату",
+    "msg.birthdayReminder":   "🎂 Через 3 дня день рождения у *{name}*!\n\n🎁 Загляни в их вишлист — выбери подарок заранее:",
+    "ibtn.viewWishlist":      "🎁 Смотреть вишлист",
+
     // ─── Partners ───────────────────────────────────────────────────────────
     "btn.partners":             "👥 Партнёры",
     "msg.partnersEmpty":        "У тебя пока нет партнёров.\n\nДобавь первого — введи его Telegram ID (он может найти ID в боте через «👤 Мой ID» в Настройках).",
@@ -551,6 +562,17 @@ const translations = {
     "holiday.name.newyear":   "Новий рік",
     "holiday.name.valentine": "День Святого Валентина",
 
+    // ─── Birthday reminders ─────────────────────────────────────────────────
+    "btn.birthday":           "🎂 День народження",
+    "msg.enterBirthday":      "Введи дату народження у форматі *ДД.ММ*\nНаприклад: *15.03* (15 березня)\n\nДрузі, які додали тебе як партнера, отримають нагадування за 3 дні до свята 🎉",
+    "msg.birthdayAlreadySet": "🎂 Твій день народження: *{date}*\n\nВведи нову дату щоб змінити:",
+    "msg.birthdaySet":        "✅ День народження встановлено: *{date}* 🎂\n\nДрузі отримають нагадування за 3 дні!",
+    "msg.birthdayInvalid":    "❌ Невірний формат. Введи дату як *ДД.ММ*, наприклад: *15.03*",
+    "msg.birthdayRemoved":    "✅ День народження видалено.",
+    "ibtn.removeBirthday":    "🗑 Видалити дату",
+    "msg.birthdayReminder":   "🎂 Через 3 дні день народження у *{name}*!\n\n🎁 Загляни в їх вішліст — обери подарунок заздалегідь:",
+    "ibtn.viewWishlist":      "🎁 Переглянути вішліст",
+
     // ─── Partners ───────────────────────────────────────────────────────────
     "btn.partners":             "👥 Партнери",
     "msg.partnersEmpty":        "У тебе поки немає партнерів.\n\nДодай першого — введи його Telegram ID (він може знайти ID у боті через «👤 Мій ID» у Налаштуваннях).",
@@ -832,6 +854,17 @@ const translations = {
     "holiday.name.march8":    "March 8",
     "holiday.name.newyear":   "New Year",
     "holiday.name.valentine": "Valentine's Day",
+
+    // ─── Birthday reminders ─────────────────────────────────────────────────
+    "btn.birthday":           "🎂 Birthday",
+    "msg.enterBirthday":      "Enter your birthday in format *DD.MM*\nExample: *15.03* (March 15)\n\nFriends who added you as a partner will get a reminder 3 days before 🎉",
+    "msg.birthdayAlreadySet": "🎂 Your birthday: *{date}*\n\nEnter a new date to change it:",
+    "msg.birthdaySet":        "✅ Birthday set: *{date}* 🎂\n\nFriends will get a reminder 3 days before!",
+    "msg.birthdayInvalid":    "❌ Wrong format. Enter date as *DD.MM*, e.g.: *15.03*",
+    "msg.birthdayRemoved":    "✅ Birthday removed.",
+    "ibtn.removeBirthday":    "🗑 Remove date",
+    "msg.birthdayReminder":   "🎂 *{name}*'s birthday is in 3 days!\n\n🎁 Check their wishlist and pick a gift in advance:",
+    "ibtn.viewWishlist":      "🎁 View wishlist",
 
     // ─── Partners ───────────────────────────────────────────────────────────
     "btn.partners":             "👥 Partners",

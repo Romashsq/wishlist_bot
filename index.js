@@ -132,14 +132,14 @@ function getSecondaryKeyboard(userId) {
   return Keyboard.from(rows).resized();
 }
 
-function getSettingsKeyboard(lang, notifsEnabled = false, pledgeNotifsEnabled = true) {
+function getSettingsKeyboard(lang, notifsEnabled = false, birthday = null) {
   const notifsBtn = notifsEnabled ? t(lang, "btn.notifsOn") : t(lang, "btn.notifsOff");
-  const pledgeBtn = pledgeNotifsEnabled ? t(lang, "btn.pledgeNotifsOn") : t(lang, "btn.pledgeNotifsOff");
+  const birthdayBtn = birthday ? `🎂 ${birthday} ✏️` : t(lang, "btn.birthday");
   return Keyboard.from([
     [t(lang, "btn.bindBuyer"), t(lang, "btn.unbindBuyer")],
     [t(lang, "btn.myId"), t(lang, "btn.langSettings")],
     [notifsBtn],
-    [pledgeBtn],
+    [birthdayBtn],
     [t(lang, "btn.back")],
   ]).resized();
 }
@@ -1011,6 +1011,25 @@ bot.command("start", async (ctx) => {
       }
     }
 
+    // ─── Shared wishlist deep link: ?start=share_USERID ─────────────────
+    if (payload?.startsWith("share_")) {
+      const ownerId = payload.slice(6);
+      const ownerUser = await User.findOne({ userId: ownerId });
+      const ownerName = escMd(ownerUser?.firstName || "?");
+      const wishes = await Wish.find({ ownerId, status: { $ne: "archived" }, holiday: null }).sort({ createdAt: 1 });
+      const mainKb = await getMainKeyboard(userId);
+      if (!wishes.length) {
+        await ctx.reply(`🎁 Вишлист *${ownerName}* пока пуст.`, { parse_mode: "Markdown", reply_markup: mainKb });
+      } else {
+        await ctx.reply(`🎁 *Вишлист ${ownerName}*:`, { parse_mode: "Markdown", reply_markup: mainKb });
+        for (const w of wishes) {
+          const guestKb = getHolidayWishGuestKeyboard(w, userId, lang);
+          await sendWishCard(ctx, null, w, guestKb, lang, false);
+        }
+      }
+      return;
+    }
+
     const name = ctx.from.first_name || "друг";
     const caption = t(lang, "msg.start", { name: escMd(name) });
     const keyboard = await getMainKeyboard(userId);
@@ -1259,8 +1278,8 @@ bot.on("message:text", async (ctx) => {
     if (text === t(lang, "btn.settings")) {
       const userDoc = await User.findOne({ userId });
       const notifsEnabled = userDoc?.receiveGiftNotifs ?? false;
-      const pledgeNotifsEnabled = userDoc?.receivePledgeNotifs ?? true;
-      await ctx.reply(t(lang, "msg.settings"), { reply_markup: getSettingsKeyboard(lang, notifsEnabled, pledgeNotifsEnabled) });
+      const birthday = userDoc?.birthday ?? null;
+      await ctx.reply(t(lang, "msg.settings"), { reply_markup: getSettingsKeyboard(lang, notifsEnabled, birthday) });
       return;
     }
 
@@ -1271,30 +1290,25 @@ bot.on("message:text", async (ctx) => {
       const userDoc = await User.findOne({ userId });
       const current = userDoc?.receiveGiftNotifs ?? false;
       const next = !current;
-      const pledgeNotifsEnabled = userDoc?.receivePledgeNotifs ?? true;
       await User.findOneAndUpdate({ userId }, { receiveGiftNotifs: next });
       const msgKey = next ? "msg.notifsEnabled" : "msg.notifsDisabled";
       await ctx.reply(t(lang, msgKey), {
         parse_mode: "Markdown",
-        reply_markup: getSettingsKeyboard(lang, next, pledgeNotifsEnabled),
+        reply_markup: getSettingsKeyboard(lang, next, userDoc?.birthday ?? null),
       });
       return;
     }
 
-    if (
-      text === t(lang, "btn.pledgeNotifsOn") ||
-      text === t(lang, "btn.pledgeNotifsOff")
-    ) {
+    if (text === t(lang, "btn.birthday") || /^\🎂 \d{2}\.\d{2} ✏️$/.test(text)) {
       const userDoc = await User.findOne({ userId });
-      const current = userDoc?.receivePledgeNotifs ?? true;
-      const next = !current;
-      const notifsEnabled = userDoc?.receiveGiftNotifs ?? false;
-      await User.findOneAndUpdate({ userId }, { receivePledgeNotifs: next });
-      const msgKey = next ? "msg.pledgeNotifsEnabled" : "msg.pledgeNotifsDisabled";
-      await ctx.reply(t(lang, msgKey), {
-        parse_mode: "Markdown",
-        reply_markup: getSettingsKeyboard(lang, notifsEnabled, next),
-      });
+      const cur = userDoc?.birthday ?? null;
+      if (cur) {
+        const kb = new InlineKeyboard().text(t(lang, "ibtn.removeBirthday"), "birthday:remove");
+        await ctx.reply(t(lang, "msg.birthdayAlreadySet", { date: cur }), { parse_mode: "Markdown", reply_markup: kb });
+      } else {
+        await ctx.reply(t(lang, "msg.enterBirthday"), { parse_mode: "Markdown" });
+      }
+      setState(userId, { ...getState(userId), mode: "set_birthday" });
       return;
     }
 
@@ -1632,6 +1646,28 @@ bot.on("message:text", async (ctx) => {
       return;
     }
 
+    // ── State: set_birthday ───────────────────────────────────────────────
+    if (s.mode === "set_birthday") {
+      const input = text.trim();
+      const m = input.match(/^(\d{1,2})[.\-\/](\d{1,2})$/);
+      if (!m) {
+        await ctx.reply(t(lang, "msg.birthdayInvalid"), { parse_mode: "Markdown" });
+        return;
+      }
+      const day = String(m[1]).padStart(2, "0");
+      const month = String(m[2]).padStart(2, "0");
+      const birthday = `${day}.${month}`; // "15.03"
+      const birthdayStore = `${month}-${day}`; // "03-15" for cron matching
+      await User.findOneAndUpdate({ userId }, { birthday: birthdayStore });
+      clearState(userId);
+      setState(userId, { lang });
+      await ctx.reply(
+        t(lang, "msg.birthdaySet", { date: birthday }),
+        { parse_mode: "Markdown", reply_markup: getSettingsKeyboard(lang, false, birthdayStore) }
+      );
+      return;
+    }
+
     // ── State: add_partner ────────────────────────────────────────────────
     if (s.mode === "add_partner") {
       if (s.step === "id") {
@@ -1960,6 +1996,15 @@ bot.on("callback_query:data", async (ctx) => {
     const s = getState(userId);
 
     // ─── Partners callbacks ───────────────────────────────────────────────
+    if (data === "birthday:remove") {
+      await User.findOneAndUpdate({ userId }, { birthday: null });
+      const userDoc = await User.findOne({ userId });
+      await ctx.reply(t(lang, "msg.birthdayRemoved"), {
+        reply_markup: getSettingsKeyboard(lang, userDoc?.receiveGiftNotifs ?? false, null),
+      });
+      return;
+    }
+
     if (data === "partners:add") {
       clearState(userId);
       setState(userId, { mode: "add_partner", step: "id", lang });
@@ -2052,22 +2097,7 @@ bot.on("callback_query:data", async (ctx) => {
         }),
         { parse_mode: "Markdown" }
       );
-      // Notify wish owner (if they have pledge notifications enabled)
-      try {
-        const ownerDoc = await User.findOne({ userId: wish.ownerId });
-        if (ownerDoc?.receivePledgeNotifs !== false) {
-          const ownerLang = ownerDoc?.lang ?? "ru";
-          await bot.api.sendMessage(
-            wish.ownerId,
-            t(ownerLang, "msg.pledgeOwnerNotify", {
-              name: escMd(ctx.from.first_name || "Кто-то"),
-              title: escMd(wish.title),
-              holiday: getHolidayName(ownerLang, wish.holiday ?? "birthday"),
-            }),
-            { parse_mode: "Markdown" }
-          );
-        }
-      } catch { /* owner may be unreachable */ }
+      // Secret booking: owner is NOT notified — it stays a surprise
       return;
     }
 
@@ -2083,22 +2113,7 @@ bot.on("callback_query:data", async (ctx) => {
         t(lang, "msg.pledgeTaken", { title: escMd(wish.title) }),
         { parse_mode: "Markdown" }
       );
-      // Notify wish owner (if they have pledge notifications enabled)
-      try {
-        const ownerDoc = await User.findOne({ userId: wish.ownerId });
-        if (ownerDoc?.receivePledgeNotifs !== false) {
-          const ownerLang = ownerDoc?.lang ?? "ru";
-          await bot.api.sendMessage(
-            wish.ownerId,
-            t(ownerLang, "msg.pledgeOwnerNotify", {
-              name: escMd(ctx.from.first_name || "Кто-то"),
-              title: escMd(wish.title),
-              holiday: getHolidayName(ownerLang, wish.holiday ?? "birthday"),
-            }),
-            { parse_mode: "Markdown" }
-          );
-        }
-      } catch { /* owner may be unreachable */ }
+      // Secret booking: owner is NOT notified — it stays a surprise
       return;
     }
 
@@ -2738,6 +2753,49 @@ bot.catch((err) => {
 // ─── Start ────────────────────────────────────────────────────────────────
 console.log("Wishlist bot starting...");
 await connectDB();
+
+// ─── Birthday reminder cron (runs every hour, sends at 10:00) ─────────────
+const sentBirthdayToday = new Set(); // "partnerId-year" prevents duplicates on same day
+
+setInterval(async () => {
+  try {
+    const now = new Date();
+    if (now.getHours() !== 10) return; // Only at 10 AM
+
+    const reminderDate = new Date(now);
+    reminderDate.setDate(reminderDate.getDate() + 3);
+    const month = String(reminderDate.getMonth() + 1).padStart(2, "0");
+    const day   = String(reminderDate.getDate()).padStart(2, "0");
+    const targetBirthday = `${month}-${day}`; // "03-15"
+    const currentYear = now.getFullYear();
+
+    const usersWithBirthday = await User.find({ birthday: targetBirthday });
+    for (const birthdayUser of usersWithBirthday) {
+      const partnerships = await Partnership.find({
+        toUserId: birthdayUser.userId,
+        birthdayReminderSentYear: { $ne: currentYear },
+      });
+      for (const p of partnerships) {
+        const key = `${p._id}-${currentYear}`;
+        if (sentBirthdayToday.has(key)) continue;
+        sentBirthdayToday.add(key);
+        try {
+          const viewerLang = await fetchUserLang(p.fromUserId);
+          const wishlistLink = `https://t.me/${BOT_USERNAME}?start=share_${birthdayUser.userId}`;
+          await bot.api.sendMessage(
+            p.fromUserId,
+            t(viewerLang, "msg.birthdayReminder", { name: escMd(birthdayUser.firstName || "?") }),
+            {
+              parse_mode: "Markdown",
+              reply_markup: new InlineKeyboard().url(t(viewerLang, "ibtn.viewWishlist"), wishlistLink),
+            }
+          );
+          await Partnership.updateOne({ _id: p._id }, { birthdayReminderSentYear: currentYear });
+        } catch { /* user may be unreachable */ }
+      }
+    }
+  } catch (e) { console.error("Birthday reminder error:", e); }
+}, 60 * 60 * 1000); // every hour
 
 async function startBot(attempt = 1) {
   try {

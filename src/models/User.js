@@ -10,6 +10,7 @@ const userSchema = new mongoose.Schema({
   langSet: { type: Boolean, default: false },
   receiveGiftNotifs: { type: Boolean, default: false },
   receivePledgeNotifs: { type: Boolean, default: true },
+  birthday: { type: String, default: null }, // "MM-DD" e.g. "03-15"
   createdAt: { type: Date, default: Date.now },
 });
 
