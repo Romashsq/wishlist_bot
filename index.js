@@ -433,9 +433,8 @@ HOW TO SUGGEST:
 LANGUAGE: Always respond in the SAME language the user is writing in.
 Keep each response under 200 words.`;
 
-async function startGiftChat(userId) {
-  const ownerId = (await getOwnerId(userId)) || userId;
-  const wishes = await Wish.find({ ownerId, status: { $ne: "archived" } });
+async function startGiftChat(targetUserId) {
+  const wishes = await Wish.find({ ownerId: targetUserId, status: { $ne: "archived" } });
   const wishList = wishes.map((w) => `"${w.title}" (${w.price})`).join(", ");
   const userMsg = wishList
     ? `Based on this wishlist: ${wishList}\n\nSuggest ONE specific gift idea that fits this person's taste. Must include product name, price estimate, and a direct purchase link from a verified international source.`
@@ -1260,10 +1259,21 @@ bot.on("message:text", async (ctx) => {
     if (text === t(lang, "btn.giftIdea")) {
       clearState(userId);
       setState(userId, { mode: "gift_chat", giftHistory: [], lang });
-      await ctx.reply(t(lang, "msg.giftChatStart"), {
+      const partnerships = await Partnership.find({ fromUserId: userId });
+      const kb = new InlineKeyboard();
+      kb.text(t(lang, "ibtn.gift.forMe"), `gift:for:${userId}`).row();
+      if (partnerships.length > 0) {
+        const ownerIds = partnerships.map(p => p.toUserId);
+        const owners = await User.find({ userId: { $in: ownerIds } });
+        const ownerMap = Object.fromEntries(owners.map(u => [u.userId, u.firstName || "?"]));
+        for (const p of partnerships) {
+          const name = ownerMap[p.toUserId] || "?";
+          kb.text(`${name} (${p.role})`, `gift:for:${p.toUserId}`).row();
+        }
+      }
+      await ctx.reply(t(lang, "msg.giftForWhom"), {
         parse_mode: "Markdown",
-        reply_markup: new InlineKeyboard()
-          .text(t(lang, "ibtn.gift.auto"), "gift:auto"),
+        reply_markup: kb,
       });
       return;
     }
@@ -2647,11 +2657,37 @@ bot.on("callback_query:data", async (ctx) => {
     if (data.startsWith("gift:")) {
       const action = data.split(":")[1];
 
+      if (action === "for") {
+        const targetId = data.split(":")[2];
+        const targetUser = await User.findOne({ userId: targetId });
+        const targetName = targetUser?.firstName || "?";
+        setState(userId, { mode: "gift_chat", giftHistory: [], lang, giftTargetId: targetId });
+        await ctx.reply(t(lang, "msg.giftChatThink"));
+        try {
+          const { reply, history } = await startGiftChat(targetId);
+          setState(userId, { mode: "gift_chat", giftHistory: history, lastGiftMsg: reply, giftTargetId: targetId, giftTargetName: targetName });
+          const isSelf = targetId === userId;
+          const header = isSelf ? "" : t(lang, "msg.giftForPerson", { name: escMd(targetName) }) + "\n\n";
+          await ctx.reply(header + reply, {
+            parse_mode: "Markdown",
+            reply_markup: new InlineKeyboard()
+              .text(t(lang, "ibtn.gift.another"), "gift:another").row()
+              .text(t(lang, "ibtn.gift.save"), "gift:save")
+              .text(t(lang, "ibtn.gift.close"), "gift:close"),
+          });
+        } catch (e) {
+          console.error("gift:for error:", e.message);
+          await ctx.reply(t(lang, "msg.giftChatError"));
+        }
+        return;
+      }
+
       if (action === "auto") {
+        // Legacy fallback — redirect to self
         await ctx.reply(t(lang, "msg.giftChatThink"));
         try {
           const { reply, history } = await startGiftChat(userId);
-          setState(userId, { mode: "gift_chat", giftHistory: history, lastGiftMsg: reply });
+          setState(userId, { mode: "gift_chat", giftHistory: history, lastGiftMsg: reply, giftTargetId: userId });
           await ctx.reply(reply, {
             reply_markup: new InlineKeyboard()
               .text(t(lang, "ibtn.gift.another"), "gift:another").row()
