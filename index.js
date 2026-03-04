@@ -113,7 +113,7 @@ async function getMainKeyboard(userId) {
     [t(lang, "btn.addProduct"), t(lang, "btn.findProduct")],
     [t(lang, "btn.myWishes"), t(lang, "btn.giftIdea")],
   ];
-  if (buyer) rows.push([t(lang, "btn.partnerWishes"), t(lang, "btn.history")]);
+  if (buyer) rows.push([t(lang, "btn.partnerWishes")]);
   rows.push([t(lang, "btn.myPledges")]);
   rows.push([t(lang, "btn.moreMenu")]);
   return Keyboard.from(rows).resized();
@@ -766,15 +766,24 @@ async function searchGoogleShopping(query) {
 }
 
 // ─── Business logic ───────────────────────────────────────────────────────
-async function showOwnerWishes(ctx, lang) {
+async function showOwnerWishes(ctx, lang, showAll = false) {
   const ownerId = String(ctx.from.id);
   const wishes = await Wish.find({ ownerId, status: { $ne: "archived" } }).sort({ createdAt: 1 });
   if (wishes.length === 0) {
     await ctx.reply(t(lang, "msg.noWishes"));
     return;
   }
-  const slice = wishes.slice(-10);
-  await ctx.reply(t(lang, "msg.myWishesHeader", { count: slice.length }), { parse_mode: "Markdown" });
+  const PREVIEW = 3;
+  const hasMore = !showAll && wishes.length > PREVIEW;
+  const slice = hasMore ? wishes.slice(-PREVIEW) : wishes;
+  const shareUrl = `https://t.me/${BOT_USERNAME}?start=share_${ownerId}`;
+  const headerText = hasMore
+    ? t(lang, "msg.myWishesPreview", { shown: slice.length, total: wishes.length })
+    : t(lang, "msg.myWishesHeader", { count: wishes.length });
+  const kb = new InlineKeyboard();
+  if (hasMore) kb.text(t(lang, "ibtn.showAllWishes", { count: wishes.length }), "mywishes:all").row();
+  kb.url(t(lang, "ibtn.shareWishlist"), shareUrl);
+  await ctx.reply(headerText, { parse_mode: "Markdown", reply_markup: kb });
   for (const wish of slice) await sendWishCard(ctx, ownerId, wish, undefined, lang, false);
 }
 
@@ -2073,6 +2082,12 @@ bot.on("callback_query:data", async (ctx) => {
     if (data === "link_cancel") {
       clearState(userId);
       await ctx.reply(t(lang, "msg.cancelAdd"), { reply_markup: await getMainKeyboard(userId) });
+      return;
+    }
+
+    // ─── My wishlist: show all ─────────────────────────────────────────────
+    if (data === "mywishes:all") {
+      await showOwnerWishes(ctx, lang, true);
       return;
     }
 
