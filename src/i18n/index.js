@@ -319,6 +319,12 @@ const translations = {
     "msg.choosePartner":        "💝 *Чьи хотелки посмотреть?*\n\nВыбери партнёра:",
     "msg.viewingWishesOf":      "💝 *Хотелки {name}* ({role}):",
     "msg.partnerNoWishes":      "У этого партнёра пока нет хотелок 🎁",
+    "msg.noPartners":           "👥 У тебя пока нет ни одного партнёра.\n\nДобавь через ➡️ Ещё → 👥 Партнёры",
+    "ibtn.goToPartners":        "👥 Добавить партнёра",
+    "msg.chooseCategory":       "💝 *Чьи хотелки?*\n\nВыбери категорию:",
+    "msg.choosePerson":         "💝 Выбери кого смотреть:",
+    "msg.wishesOf":             "💝 *Хотелки {name}* — последние {shown} из {total}:",
+    "msg.wishesOfAll":          "💝 *Хотелки {name}* (все {total}):",
 
     // ─── Link skip words ────────────────────────────────────────────────────
     "linkSkip": ["нет", "no", "none", "-"],
@@ -631,6 +637,12 @@ const translations = {
     "msg.choosePartner":        "💝 *Чиї хотілки переглянути?*\n\nВибери партнера:",
     "msg.viewingWishesOf":      "💝 *Хотілки {name}* ({role}):",
     "msg.partnerNoWishes":      "У цього партнера поки немає хотілок 🎁",
+    "msg.noPartners":           "👥 У тебе поки немає жодного партнера.\n\nДодай через ➡️ Ще → 👥 Партнери",
+    "ibtn.goToPartners":        "👥 Додати партнера",
+    "msg.chooseCategory":       "💝 *Чиї хотілки?*\n\nВибери категорію:",
+    "msg.choosePerson":         "💝 Вибери кого дивитись:",
+    "msg.wishesOf":             "💝 *Хотілки {name}* — останні {shown} з {total}:",
+    "msg.wishesOfAll":          "💝 *Хотілки {name}* (всі {total}):",
 
     "linkSkip": ["ні", "нет", "no", "none", "-"],
   },
@@ -942,6 +954,12 @@ const translations = {
     "msg.choosePartner":        "💝 *Whose wishlist to view?*\n\nChoose a partner:",
     "msg.viewingWishesOf":      "💝 *{name}'s Wishlist* ({role}):",
     "msg.partnerNoWishes":      "This partner has no wishlist items yet 🎁",
+    "msg.noPartners":           "👥 You have no partners yet.\n\nAdd one via ➡️ More → 👥 Partners",
+    "ibtn.goToPartners":        "👥 Add a partner",
+    "msg.chooseCategory":       "💝 *Whose wishlist?*\n\nChoose a category:",
+    "msg.choosePerson":         "💝 Choose who to view:",
+    "msg.wishesOf":             "💝 *{name}'s Wishlist* — last {shown} of {total}:",
+    "msg.wishesOfAll":          "💝 *{name}'s Wishlist* (all {total}):",
 
     "linkSkip": ["no", "none", "-"],
   },

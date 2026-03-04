@@ -108,14 +108,13 @@ async function isBuyerUser(userId) {
 // ─── Keyboards ───────────────────────────────────────────────────────────
 async function getMainKeyboard(userId) {
   const lang = getLang(userId);
-  const buyer = await isBuyerUser(String(userId));
   const rows = [
     [t(lang, "btn.addProduct"), t(lang, "btn.findProduct")],
     [t(lang, "btn.myWishes"), t(lang, "btn.giftIdea")],
+    [t(lang, "btn.partnerWishes")],
+    [t(lang, "btn.myPledges")],
+    [t(lang, "btn.moreMenu")],
   ];
-  if (buyer) rows.push([t(lang, "btn.partnerWishes")]);
-  rows.push([t(lang, "btn.myPledges")]);
-  rows.push([t(lang, "btn.moreMenu")]);
   return Keyboard.from(rows).resized();
 }
 
@@ -274,7 +273,7 @@ function getBuyerWishKeyboard(wishId, lang) {
 }
 
 // ─── Caption builder ──────────────────────────────────────────────────────
-function wishCaption(wish, lang, forBuyer = false) {
+function wishCaption(wish, lang, forBuyer = false, hideStatus = false) {
   const stars = "⭐".repeat(wish.priority || 1);
   const statusMap = {
     new:      t(lang, "status.new"),
@@ -286,9 +285,13 @@ function wishCaption(wish, lang, forBuyer = false) {
   text += `${stars} Приоритет\n`;
   text += `💰 ${escMd(wish.price)}\n`;
   if (wish.link) text += `🔗 [Ссылка](${wish.link})\n`;
-  text += `Статус: ${statusMap[wish.status] ?? wish.status}`;
-  if (wish.pledgedBy && wish.status === "bought" && wish.pledgedByName)
-    text += `\n🛍 Куплено: ${escMd(wish.pledgedByName)}`;
+  if (!hideStatus) {
+    text += `Статус: ${statusMap[wish.status] ?? wish.status}`;
+    if (wish.pledgedBy && wish.status === "bought" && wish.pledgedByName)
+      text += `\n🛍 Куплено: ${escMd(wish.pledgedByName)}`;
+  } else if (wish.pledgedBy && wish.status === "bought" && wish.pledgedByName) {
+    text += `🛍 Куплено: ${escMd(wish.pledgedByName)}`;
+  }
   if (forBuyer && wish.noteFromBuyer)
     text += `\n📝 Заметка: _${escMd(wish.noteFromBuyer)}_`;
   if (wish.createdAt) {
@@ -304,8 +307,8 @@ function escMd(str) {
 }
 
 // ─── Send wish card helper ────────────────────────────────────────────────
-async function sendWishCard(target, chatId, wish, keyboard, lang, forBuyer = false) {
-  const caption = wishCaption(wish, lang, forBuyer);
+async function sendWishCard(target, chatId, wish, keyboard, lang, forBuyer = false, hideStatus = false) {
+  const caption = wishCaption(wish, lang, forBuyer, hideStatus);
   const msgOpts = { parse_mode: "Markdown", ...(keyboard ? { reply_markup: keyboard } : {}) };
   const photo = wish.photoFileId || wish.photoUrl || null;
 
@@ -807,59 +810,63 @@ async function showOwnerWishes(ctx, lang, showAll = false) {
 async function showPartnerWishes(ctx, lang) {
   const viewerId = String(ctx.from.id);
 
-  // Check for multi-partner partnerships first
   const partnerships = await Partnership.find({ fromUserId: viewerId });
-  if (partnerships.length > 0) {
-    const ownerIds = partnerships.map(p => p.toUserId);
-    const owners = await User.find({ userId: { $in: ownerIds } });
-    const ownerMap = Object.fromEntries(owners.map(u => [u.userId, u.firstName || "?"]));
 
-    if (partnerships.length === 1) {
-      // Only one partner — go straight to their wishes
-      const p = partnerships[0];
-      await showWishesOfPartner(ctx, viewerId, p.toUserId, ownerMap[p.toUserId] || "?", p.role, lang);
+  if (partnerships.length === 0) {
+    // Fallback: old single-binding system
+    const ownerId = await getOwnerId(viewerId);
+    if (!ownerId) {
+      await ctx.reply(t(lang, "msg.noPartners"), {
+        parse_mode: "Markdown",
+        reply_markup: new InlineKeyboard().text(t(lang, "ibtn.goToPartners"), "partners_menu"),
+      });
       return;
     }
-
-    // Multiple partners — show selection list
-    const kb = new InlineKeyboard();
-    for (const p of partnerships) {
-      const name = ownerMap[p.toUserId] || "?";
-      kb.text(`${name} (${p.role})`, `partner_wishes:${p.toUserId}`).row();
-    }
-    await ctx.reply(t(lang, "msg.choosePartner"), { parse_mode: "Markdown", reply_markup: kb });
+    // Old binding — go straight to owner's wishes
+    const ownerUser = await User.findOne({ userId: ownerId });
+    await showWishesOfPartner(ctx, viewerId, ownerId, ownerUser?.firstName || "?", "❤️", lang);
     return;
   }
 
-  // Fallback: old single-binding system
-  const ownerId = await getOwnerId(viewerId);
-  if (!ownerId) {
-    await ctx.reply(t(lang, "msg.notBoundAsBuyer"));
+  if (partnerships.length === 1) {
+    const p = partnerships[0];
+    const ownerUser = await User.findOne({ userId: p.toUserId });
+    await showWishesOfPartner(ctx, viewerId, p.toUserId, ownerUser?.firstName || "?", p.role, lang);
     return;
   }
-  const wishes = await Wish.find({ ownerId, status: { $ne: "archived" } }).sort({ createdAt: 1 });
-  if (wishes.length === 0) {
-    await ctx.reply(t(lang, "msg.noPartnerWishes"));
-    return;
+
+  // Group by role → show category buttons
+  const roleMap = {};
+  for (const p of partnerships) {
+    if (!roleMap[p.role]) roleMap[p.role] = [];
+    roleMap[p.role].push(p);
   }
-  const slice = wishes.slice(-10);
-  await ctx.reply(t(lang, "msg.partnerWishesHeader", { count: slice.length }), { parse_mode: "Markdown" });
-  for (const wish of slice) await sendWishCard(ctx, viewerId, wish, getBuyerWishKeyboard(wish.id, lang), lang, true);
+  const kb = new InlineKeyboard();
+  for (const role of Object.keys(roleMap)) {
+    kb.text(role, `pw_cat:${role}`).row();
+  }
+  await ctx.reply(t(lang, "msg.chooseCategory"), { parse_mode: "Markdown", reply_markup: kb });
 }
 
-async function showWishesOfPartner(ctx, viewerId, ownerId, ownerName, role, lang) {
+async function showWishesOfPartner(ctx, viewerId, ownerId, ownerName, role, lang, showAll = false) {
   const wishes = await Wish.find({ ownerId, status: { $ne: "archived" } }).sort({ createdAt: 1 });
   if (wishes.length === 0) {
     await ctx.reply(t(lang, "msg.partnerNoWishes"));
     return;
   }
-  const slice = wishes.slice(-10);
-  await ctx.reply(
-    t(lang, "msg.viewingWishesOf", { name: escMd(ownerName), role: escMd(role) }),
-    { parse_mode: "Markdown" }
-  );
+  const PREVIEW = 3;
+  const hasMore = !showAll && wishes.length > PREVIEW;
+  const slice = hasMore ? wishes.slice(-PREVIEW) : wishes;
+  const headerText = hasMore
+    ? t(lang, "msg.wishesOf", { name: escMd(ownerName), shown: slice.length, total: wishes.length })
+    : t(lang, "msg.wishesOfAll", { name: escMd(ownerName), total: wishes.length });
+  const headerKb = hasMore
+    ? new InlineKeyboard().text(t(lang, "ibtn.viewAll", { count: wishes.length }), `pw_all:${ownerId}`)
+    : undefined;
+  await ctx.reply(headerText, { parse_mode: "Markdown", ...(headerKb ? { reply_markup: headerKb } : {}) });
   for (const wish of slice) {
-    await sendWishCard(ctx, viewerId, wish, getBuyerWishKeyboard(wish.id, lang), lang, true);
+    const kb = getHolidayWishGuestKeyboard(wish, viewerId, lang);
+    await sendWishCard(ctx, viewerId, wish, kb, lang, false, true);
   }
 }
 
@@ -1270,6 +1277,47 @@ bot.on("message:text", async (ctx) => {
         : t(lang, "msg.savedBtns.empty");
       await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: kb });
       return;
+    }
+
+    // ── Share link pasted as text ─────────────────────────────────────────
+    const shareLinkMatch = text.match(/[?&]start=(share_(\d+)|hw_([a-zA-Z]+)_(\d+))/);
+    if (shareLinkMatch) {
+      const startPayload = shareLinkMatch[1];
+      if (startPayload.startsWith("share_")) {
+        const ownerId = startPayload.slice(6);
+        const ownerUser = await User.findOne({ userId: ownerId });
+        const ownerName = escMd(ownerUser?.firstName || ownerUser?.username || "?");
+        const count = await Wish.countDocuments({ ownerId, status: { $ne: "archived" }, holiday: null });
+        if (!count) {
+          await ctx.reply(t(lang, "msg.shareEmpty", { name: ownerName }), { parse_mode: "Markdown" });
+        } else {
+          const kb = new InlineKeyboard();
+          if (count > 3) kb.text(t(lang, "ibtn.viewLast3"), `share_load:${ownerId}:3`).row();
+          kb.text(t(lang, "ibtn.viewAll", { count }), `share_load:${ownerId}:all`).row();
+          kb.text(t(lang, "btn.back"), `noop:cancel`);
+          await ctx.reply(t(lang, "msg.shareHeader", { name: ownerName }), { parse_mode: "Markdown", reply_markup: kb });
+        }
+        return;
+      }
+      if (startPayload.startsWith("hw_")) {
+        const parts = startPayload.split("_");
+        const holiday = parts[1];
+        const targetId = parts[2];
+        const targetUser = await User.findOne({ userId: targetId });
+        const ownerName = escMd(targetUser?.firstName || "?");
+        const holidayName = getHolidayName(lang, holiday);
+        const count = await Wish.countDocuments({ ownerId: targetId, holiday, status: { $ne: "archived" } });
+        if (!count) {
+          await ctx.reply(t(lang, "msg.hwShareEmpty", { name: ownerName, holiday: holidayName }), { parse_mode: "Markdown" });
+        } else {
+          const kb = new InlineKeyboard();
+          if (count > 3) kb.text(t(lang, "ibtn.viewLast3"), `hw_load:${holiday}:${targetId}:3`).row();
+          kb.text(t(lang, "ibtn.viewAll", { count }), `hw_load:${holiday}:${targetId}:all`).row();
+          kb.text(t(lang, "btn.back"), `noop:cancel`);
+          await ctx.reply(t(lang, "msg.hwShareHeader", { name: ownerName, holiday: holidayName }), { parse_mode: "Markdown", reply_markup: kb });
+        }
+        return;
+      }
     }
 
     // ── Reply keyboard buttons ────────────────────────────────────────────
@@ -2092,6 +2140,42 @@ bot.on("callback_query:data", async (ctx) => {
         t(lang, "msg.partnerAdded", { name: escMd(s2.pendingPartnerName || "?"), role: escMd(role) }),
         { parse_mode: "Markdown", reply_markup: await getMainKeyboard(userId) }
       );
+      return;
+    }
+
+    if (data === "partners_menu") {
+      // Redirect to secondary menu where "👥 Партнёры" lives
+      await ctx.reply(t(lang, "msg.secondaryMenu"), { reply_markup: getSecondaryKeyboard(userId) });
+      await ctx.answerCallbackQuery();
+      return;
+    }
+
+    if (data.startsWith("pw_cat:")) {
+      const role = data.slice(7);
+      const partnerships = await Partnership.find({ fromUserId: userId, role });
+      if (!partnerships.length) { await ctx.answerCallbackQuery(); return; }
+      if (partnerships.length === 1) {
+        const p = partnerships[0];
+        const ownerUser = await User.findOne({ userId: p.toUserId });
+        await showWishesOfPartner(ctx, userId, p.toUserId, ownerUser?.firstName || "?", p.role, lang);
+      } else {
+        const ownerIds = partnerships.map(p => p.toUserId);
+        const owners = await User.find({ userId: { $in: ownerIds } });
+        const ownerMap = Object.fromEntries(owners.map(u => [u.userId, u.firstName || "?"]));
+        const kb = new InlineKeyboard();
+        for (const p of partnerships) kb.text(ownerMap[p.toUserId] || "?", `partner_wishes:${p.toUserId}`).row();
+        await ctx.reply(t(lang, "msg.choosePerson"), { reply_markup: kb });
+      }
+      await ctx.answerCallbackQuery();
+      return;
+    }
+
+    if (data.startsWith("pw_all:")) {
+      const ownerId = data.split(":")[1];
+      const p = await Partnership.findOne({ fromUserId: userId, toUserId: ownerId });
+      const ownerUser = await User.findOne({ userId: ownerId });
+      await showWishesOfPartner(ctx, userId, ownerId, ownerUser?.firstName || "?", p?.role || "?", lang, true);
+      await ctx.answerCallbackQuery();
       return;
     }
 
